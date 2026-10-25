@@ -69,21 +69,14 @@ impl Db {
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> Result<T, ApiError> + Send + 'static,
     {
-        let permit = self
+        let _permit = self
             .inner
             .permits
-            .clone()
-            .acquire_owned()
+            .acquire()
             .await
             .map_err(|_| ApiError::internal("database pool is closed"))?;
 
-        let mut connection = match self.take_connection() {
-            Ok(connection) => connection,
-            Err(error) => {
-                drop(permit);
-                return Err(ApiError::database(error));
-            }
-        };
+        let mut connection = self.take_connection().map_err(ApiError::database)?;
 
         let joined = tokio::task::spawn_blocking(move || {
             let result = work(&mut connection);
@@ -94,13 +87,9 @@ impl Db {
         match joined {
             Ok((connection, result)) => {
                 self.put_connection(connection);
-                drop(permit);
                 result
             }
-            Err(error) => {
-                drop(permit);
-                Err(ApiError::internal(format!("database task failed: {error}")))
-            }
+            Err(error) => Err(ApiError::internal(format!("database task failed: {error}"))),
         }
     }
 
@@ -280,17 +269,18 @@ mod tests {
         .await
         .unwrap();
 
-        db.transaction(|transaction| {
-            transaction
-                .execute(
-                    "INSERT INTO groups (name, description) VALUES ('x', '')",
-                    [],
-                )
-                .map_err(ApiError::database)?;
-            Err(ApiError::bad_request("roll back"))
-        })
-        .await
-        .unwrap_err();
+        let rolled_back: Result<(), ApiError> = db
+            .transaction(|transaction| {
+                transaction
+                    .execute(
+                        "INSERT INTO groups (name, description) VALUES ('x', '')",
+                        [],
+                    )
+                    .map_err(ApiError::database)?;
+                Err(ApiError::bad_request("roll back"))
+            })
+            .await;
+        rolled_back.unwrap_err();
 
         let count: i64 = db
             .with_conn(|connection| {
