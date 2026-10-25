@@ -8,7 +8,7 @@ use std::process::ExitCode;
 
 use axum::routing::get;
 use axum::{Json, Router};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
@@ -47,7 +47,7 @@ async fn shutdown_signal() {
 
     #[cfg(unix)]
     let terminate = async {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         if let Ok(mut stream) = signal(SignalKind::terminate()) {
             stream.recv().await;
         }
