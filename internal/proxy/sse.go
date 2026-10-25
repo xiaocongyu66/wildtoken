@@ -66,20 +66,6 @@ func nonEmptyArray(value any) bool {
 // common when a model streams only function calls without any content or
 // reasoning text.
 func jsonHasVisibleToken(payload jsonValue) bool {
-	// Anthropic Messages API streaming events.
-	if eventType, _ := payload["type"].(string); eventType == "content_block_delta" ||
-		eventType == "content_block_start" {
-		delta := payload["delta"]
-		if delta == nil {
-			delta = payload["content_block"]
-		}
-		if nonEmptyString(valueAt(delta, "text")) ||
-			nonEmptyString(valueAt(delta, "thinking")) ||
-			nonEmptyString(valueAt(delta, "partial_json")) {
-			return true
-		}
-	}
-
 	if choices, ok := payload["choices"].([]any); ok {
 		for _, choice := range choices {
 			delta := valueAt(choice, "delta")
@@ -164,18 +150,6 @@ func HasVisibleToken(chunk []byte) bool {
 		return true
 	})
 	return visible
-}
-
-func sseLineHasVisibleToken(line string) bool {
-	data, ok := sseData(line)
-	if !ok || data == "" || data == "[DONE]" {
-		return false
-	}
-	var payload jsonValue
-	if err := json.Unmarshal([]byte(data), &payload); err != nil {
-		return false
-	}
-	return jsonHasVisibleToken(payload)
 }
 
 // sseData returns the payload of a `data:` line.
@@ -479,6 +453,7 @@ func ExtractUsage(rawBody []byte, contentType string) TokenUsage {
 	if IsSSEContentType(contentType) || strings.Contains(strings.ToLower(contentType), "sse") {
 		// A stream reports usage repeatedly, sometimes split across events.
 		var report usageReport
+		var anthropic anthropicUsageFields
 		forEachSSELine(rawBody, func(line []byte) bool {
 			data, ok := sseDataBytes(line)
 			if !ok || string(data) == "[DONE]" {
@@ -488,9 +463,16 @@ func ExtractUsage(rawBody []byte, contentType string) TokenUsage {
 			if err := json.Unmarshal(data, &payload); err != nil {
 				return true
 			}
+			if eventType, _ := payload["type"].(string); isAnthropicStreamEventType(eventType) {
+				anthropic.merge(decodeAnthropicStreamEvent(data, eventType).usage)
+				return true
+			}
 			report.add(payload)
 			return true
 		})
+		if anthropic.seen {
+			return anthropic.usage()
+		}
 		return report.usage()
 	}
 
@@ -509,7 +491,18 @@ func IsSSEContentType(contentType string) bool {
 }
 
 func sseBytesLineHasVisibleToken(line []byte) bool {
-	return sseLineHasVisibleToken(string(bytes.TrimSuffix(line, []byte("\r"))))
+	data, ok := sseDataBytes(bytes.TrimSuffix(line, []byte("\r")))
+	if !ok || len(data) == 0 || string(data) == "[DONE]" {
+		return false
+	}
+	var payload jsonValue
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return false
+	}
+	if eventType, _ := payload["type"].(string); isAnthropicStreamEventType(eventType) {
+		return decodeAnthropicStreamEvent(data, eventType).visible
+	}
+	return jsonHasVisibleToken(payload)
 }
 
 func isTerminalSSEEventType(eventType string) bool {
@@ -556,6 +549,7 @@ type sseObservation struct {
 	terminalEventPending    bool
 	terminalEventSeen       bool
 	usage                   usageReport
+	anthropicUsage          anthropicUsageFields
 	responseReasoningEffort *string
 	// streamError is the failure an error event reported, nil for a stream
 	// that ended normally. streamErrorFault says whether it blames the channel.
@@ -572,7 +566,12 @@ type sseObservation struct {
 }
 
 // tokenUsage is the usage the stream reported so far.
-func (o *sseObservation) tokenUsage() TokenUsage { return o.usage.usage() }
+func (o *sseObservation) tokenUsage() TokenUsage {
+	if o.anthropicUsage.seen {
+		return o.anthropicUsage.usage()
+	}
+	return o.usage.usage()
+}
 
 // observeLine folds one complete line into the observation. elapsedMs reports
 // how long the request has been running, for time-to-first-token.
@@ -603,6 +602,15 @@ func (o *sseObservation) observeLine(line []byte, elapsedMs func() int32) {
 	}
 	var payload jsonValue
 	if err := json.Unmarshal([]byte(data), &payload); err != nil {
+		return
+	}
+	if eventType, _ := payload["type"].(string); isAnthropicStreamEventType(eventType) {
+		event := decodeAnthropicStreamEvent([]byte(data), eventType)
+		o.anthropicUsage.merge(event.usage)
+		if event.finalUsage {
+			o.finalUsageSeen = true
+		}
+		o.outputEstimate += estimateDeltaTokens(payload)
 		return
 	}
 	o.usage.add(payload)
