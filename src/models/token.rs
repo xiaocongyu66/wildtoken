@@ -183,7 +183,7 @@ impl Default for APITokenIn {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct APITokenUpdateIn {
     #[serde(default)]
@@ -205,22 +205,6 @@ pub struct APITokenUpdateIn {
     pub allowed_models: Vec<String>,
     #[serde(default)]
     pub enabled: Option<bool>,
-}
-
-impl Default for APITokenUpdateIn {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            description: String::new(),
-            expires_at: None,
-            group_id: None,
-            token: None,
-            limit_expression: String::new(),
-            rate_limit: None,
-            allowed_models: Vec::new(),
-            enabled: None,
-        }
-    }
 }
 
 /// Carries the full token value so the console can hand it back to its owner.
@@ -281,16 +265,10 @@ impl From<&APITokenOut> for APITokenCreatedOut {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TokenEnabledIn {
     pub enabled: Option<bool>,
-}
-
-impl Default for TokenEnabledIn {
-    fn default() -> Self {
-        Self { enabled: None }
-    }
 }
 
 impl TokenEnabledIn {

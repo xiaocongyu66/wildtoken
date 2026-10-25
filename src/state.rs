@@ -65,7 +65,7 @@ impl AppState {
 /// Opens the database, creates the schema and resolves the admin credential.
 pub async fn build(settings: Settings) -> Result<AppState, String> {
     let db = Db::open(&settings.database).map_err(|error| error.message)?;
-    db.with_conn(|connection| db::schema::init(connection))
+    db.with_conn(db::schema::init)
         .await
         .map_err(|error| error.message)?;
 

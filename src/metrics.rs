@@ -174,11 +174,9 @@ impl Runtime {
 
     pub fn record_log_batch(&self) {
         self.log_write_batches_total.fetch_add(1, Ordering::Relaxed);
-        let _ = self
-            .log_queue_depth
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |depth| {
-                Some(depth.saturating_sub(1))
-            });
+        let depth = self.log_queue_depth.load(Ordering::Relaxed);
+        self.log_queue_depth
+            .store(depth.saturating_sub(1), Ordering::Relaxed);
     }
 
     pub fn record_log_dropped(&self) {

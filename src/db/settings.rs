@@ -55,22 +55,20 @@ pub async fn update_runtime_settings(
     input: RuntimeSettingsIn,
 ) -> Result<RuntimeSettings, ApiError> {
     db.transaction(move |transaction| {
-        let query = format!(
-            "UPDATE runtime_settings
-             SET log_body_keep_count = ?, log_retention_days = ?, log_body_max_bytes = ?,
-                 max_retries = ?, same_upstream_retry_interval_ms = ?,
-                 auto_weight_failure_penalty = ?, auto_weight_success_increment = ?,
-                 auto_weight_recovery_increment = ?, auto_weight_recovery_interval_seconds = ?,
-                 proxy_enabled = ?, proxy_url = ?,
-                 default_upstream_timeout_seconds = ?,
-                 image_storage_max_mb = ?,
-                 dashboard_multiplier = ?,
-                 revision = revision + 1, updated_at = datetime('now')
-             WHERE id = 1 AND revision = ?"
-        );
         let affected = transaction
             .execute(
-                &query,
+                "UPDATE runtime_settings
+                 SET log_body_keep_count = ?, log_retention_days = ?, log_body_max_bytes = ?,
+                     max_retries = ?, same_upstream_retry_interval_ms = ?,
+                     auto_weight_failure_penalty = ?, auto_weight_success_increment = ?,
+                     auto_weight_recovery_increment = ?,
+                     auto_weight_recovery_interval_seconds = ?,
+                     proxy_enabled = ?, proxy_url = ?,
+                     default_upstream_timeout_seconds = ?,
+                     image_storage_max_mb = ?,
+                     dashboard_multiplier = ?,
+                     revision = revision + 1, updated_at = datetime('now')
+                 WHERE id = 1 AND revision = ?",
                 params![
                     input.log_body_keep_count,
                     input.log_retention_days,
