@@ -166,6 +166,69 @@ jobs:
           AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
         run: cargo check --locked --target aarch64-unknown-linux-gnu
 
+  interop-argon2:
+    name: Argon2 interop with the Go baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the rewrite
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Check out the baseline revision
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASELINE_SHA }}
+          path: baseline
+          persist-credentials: false
+
+      - name: Install Go toolchain
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+          cache: false
+
+      - name: Generate a PHC hash with the Go baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p baseline/cmd/argon2dump
+          cat > baseline/cmd/argon2dump/main.go <<'GO'
+          package main
+
+          import (
+              "encoding/base64"
+              "fmt"
+
+              "golang.org/x/crypto/argon2"
+          )
+
+          func main() {
+              salt := []byte("0123456789abcdef")
+              key := argon2.IDKey([]byte("interop-admin-token"), salt, 2, 19456, 1, 32)
+              fmt.Printf("$argon2id$v=19$m=19456,t=2,p=1$%s$%s\n",
+                  base64.RawStdEncoding.EncodeToString(salt),
+                  base64.RawStdEncoding.EncodeToString(key))
+          }
+          GO
+          cd baseline
+          go run ./cmd/argon2dump > "$RUNNER_TEMP/go-phc.txt"
+          cat "$RUNNER_TEMP/go-phc.txt"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify the Go hash in Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          export GO_ARGON2_HASH="$(cat "$RUNNER_TEMP/go-phc.txt")"
+          cargo test --locked --test argon2_interop -- --nocapture
+
   docker-smoke:
     name: Docker smoke test
     needs: [fmt, clippy, test]
