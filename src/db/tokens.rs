@@ -111,7 +111,8 @@ fn get_conn(connection: &Connection, id: i64) -> Result<Option<APITokenOut>, Api
 }
 
 pub async fn get_token(db: &Db, id: i64) -> Result<Option<APITokenOut>, ApiError> {
-    db.with_conn(|connection| get_conn(connection, id)).await
+    db.with_conn(move |connection| get_conn(connection, id))
+        .await
 }
 
 fn reject_past_expiry(expires_at: Option<&str>) -> Result<(), ApiError> {

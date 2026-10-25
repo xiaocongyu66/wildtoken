@@ -33,7 +33,7 @@ pub async fn update_settings(
     let input: RuntimeSettingsIn = decode_body(&body)?;
     input.validate().map_err(ApiError::bad_request)?;
 
-    let updated = db::settings::update_runtime_settings(&state.db, &input).await?;
+    let updated = db::settings::update_runtime_settings(&state.db, input).await?;
     if updated.revision > state.runtime.get().revision {
         state.runtime.set(updated.clone());
     }
@@ -286,7 +286,7 @@ pub async fn create_group(
 ) -> Result<Response, ApiError> {
     let mut input: GroupIn = decode_body(&body)?;
     input.validate().map_err(ApiError::bad_request)?;
-    match db::groups::create_group(&state.db, &input).await {
+    match db::groups::create_group(&state.db, input).await {
         Ok(group) => Ok((StatusCode::CREATED, Json(group)).into_response()),
         Err(error) if db::is_unique_violation(&error) => {
             Err(ApiError::bad_request("group name already exists"))
@@ -307,7 +307,7 @@ pub async fn update_group(
         return Err(ApiError::bad_request("the default group cannot be renamed"));
     }
 
-    match db::groups::update_group(&state.db, id, &input).await {
+    match db::groups::update_group(&state.db, id, input).await {
         Ok(Some(group)) => Ok(Json(group).into_response()),
         Ok(None) => Err(ApiError::not_found("group not found")),
         Err(error) if db::is_unique_violation(&error) => {

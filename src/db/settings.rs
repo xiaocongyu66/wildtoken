@@ -52,9 +52,9 @@ pub async fn load_runtime_settings(db: &Db) -> Result<Option<RuntimeSettings>, A
 /// Applies a revision compare-and-swap.
 pub async fn update_runtime_settings(
     db: &Db,
-    input: &RuntimeSettingsIn,
+    input: RuntimeSettingsIn,
 ) -> Result<RuntimeSettings, ApiError> {
-    db.transaction(|transaction| {
+    db.transaction(move |transaction| {
         let query = format!(
             "UPDATE runtime_settings
              SET log_body_keep_count = ?, log_retention_days = ?, log_body_max_bytes = ?,

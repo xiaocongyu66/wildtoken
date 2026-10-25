@@ -176,7 +176,7 @@ impl Runtime {
         self.log_write_batches_total.fetch_add(1, Ordering::Relaxed);
         let _ = self
             .log_queue_depth
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |depth| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |depth| {
                 Some(depth.saturating_sub(1))
             });
     }

@@ -80,14 +80,15 @@ fn get_conn(
 }
 
 pub async fn get_group(db: &Db, id: i64) -> Result<Option<crate::models::group::Group>, ApiError> {
-    db.with_conn(|connection| get_conn(connection, id)).await
+    db.with_conn(move |connection| get_conn(connection, id))
+        .await
 }
 
 pub async fn create_group(
     db: &Db,
-    input: &GroupIn,
+    input: GroupIn,
 ) -> Result<crate::models::group::Group, ApiError> {
-    db.transaction(|transaction| {
+    db.transaction(move |transaction| {
         transaction
             .execute(
                 "INSERT INTO groups (name, description, created_at, updated_at)
@@ -104,9 +105,9 @@ pub async fn create_group(
 pub async fn update_group(
     db: &Db,
     id: i64,
-    input: &GroupIn,
+    input: GroupIn,
 ) -> Result<Option<crate::models::group::Group>, ApiError> {
-    db.transaction(|transaction| {
+    db.transaction(move |transaction| {
         let affected = transaction
             .execute(
                 "UPDATE groups SET name = ?1, description = ?2, updated_at = datetime('now')
@@ -128,7 +129,7 @@ pub async fn delete_group(db: &Db, id: i64) -> Result<bool, ApiError> {
         return Err(ApiError::bad_request("the default group cannot be deleted"));
     }
 
-    db.transaction(|transaction| {
+    db.transaction(move |transaction| {
         transaction
             .execute(
                 "UPDATE api_tokens SET group_id = ?1, updated_at = datetime('now')

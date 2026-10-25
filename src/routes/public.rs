@@ -29,11 +29,11 @@ pub async fn health(State(state): State<SharedState>) -> Result<Response, ApiErr
     Ok(Json(json!({"status": "ok", "service": "WildToken"})).into_response())
 }
 
-pub fn root() -> Response {
+pub async fn root() -> Response {
     Redirect::to("/console").into_response()
 }
 
-pub fn console() -> Result<Response, ApiError> {
+pub async fn console() -> Result<Response, ApiError> {
     let index = Path::new("web").join("dist").join("index.html");
     match fs::read(&index) {
         Ok(html) => {
@@ -55,7 +55,7 @@ pub fn console() -> Result<Response, ApiError> {
     }
 }
 
-pub fn theme_packs(State(state): State<SharedState>) -> Result<Response, ApiError> {
+pub async fn theme_packs(State(state): State<SharedState>) -> Result<Response, ApiError> {
     let packs = themes::list_packs(Path::new(&state.settings.themes.dir))
         .map_err(|error| ApiError::internal(format!("failed to read theme packs: {error}")))?;
     Ok(Json(packs).into_response())
