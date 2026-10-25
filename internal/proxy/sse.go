@@ -471,16 +471,17 @@ func ExtractUsage(rawBody []byte, contentType string) TokenUsage {
 			}
 			if isOpenAIStreamEventType(eventType) {
 				openai.merge(decodeOpenAIStreamEvent(data, eventType).usage)
+				report.add(payload)
 				return true
 			}
 			report.add(payload)
 			return true
 		})
 		if anthropic.seen {
-			return anthropic.usage()
+			return fillUsage(anthropic.usage(), report.usage())
 		}
 		if openai.seen {
-			return openai.usage()
+			return fillUsage(openai.usage(), report.usage())
 		}
 		return report.usage()
 	}
@@ -579,13 +580,37 @@ type sseObservation struct {
 	outputEstimate int64
 }
 
+// fillUsage returns base with every nil field taken from fallback, so a vendor
+// counter the SDK does not name is not lost.
+func fillUsage(base, fallback TokenUsage) TokenUsage {
+	if base.PromptTokens == nil {
+		base.PromptTokens = fallback.PromptTokens
+	}
+	if base.CompletionTokens == nil {
+		base.CompletionTokens = fallback.CompletionTokens
+	}
+	if base.TotalTokens == nil {
+		base.TotalTokens = fallback.TotalTokens
+	}
+	if base.PromptCachedTokens == nil {
+		base.PromptCachedTokens = fallback.PromptCachedTokens
+	}
+	if base.CacheCreationTokens == nil {
+		base.CacheCreationTokens = fallback.CacheCreationTokens
+	}
+	if base.CompletionReasoningTokens == nil {
+		base.CompletionReasoningTokens = fallback.CompletionReasoningTokens
+	}
+	return base
+}
+
 // tokenUsage is the usage the stream reported so far.
 func (o *sseObservation) tokenUsage() TokenUsage {
 	if o.anthropicUsage.seen {
-		return o.anthropicUsage.usage()
+		return fillUsage(o.anthropicUsage.usage(), o.usage.usage())
 	}
 	if o.openaiUsage.seen {
-		return o.openaiUsage.usage()
+		return fillUsage(o.openaiUsage.usage(), o.usage.usage())
 	}
 	return o.usage.usage()
 }
@@ -635,6 +660,9 @@ func (o *sseObservation) observeLine(line []byte, elapsedMs func() int32) {
 		if event.finalUsage {
 			o.finalUsageSeen = true
 		}
+		// Keep the generic report as a fallback for counters the SDK does not
+		// name, such as a vendor's cache-creation counter.
+		o.usage.add(payload)
 	default:
 		o.usage.add(payload)
 		if usageObject(payload) != nil && payload["type"] != "message_start" {
