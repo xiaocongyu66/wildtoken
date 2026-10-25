@@ -454,6 +454,7 @@ func ExtractUsage(rawBody []byte, contentType string) TokenUsage {
 		// A stream reports usage repeatedly, sometimes split across events.
 		var report usageReport
 		var anthropic anthropicUsageFields
+		var openai openaiUsageFields
 		forEachSSELine(rawBody, func(line []byte) bool {
 			data, ok := sseDataBytes(line)
 			if !ok || string(data) == "[DONE]" {
@@ -463,8 +464,13 @@ func ExtractUsage(rawBody []byte, contentType string) TokenUsage {
 			if err := json.Unmarshal(data, &payload); err != nil {
 				return true
 			}
-			if eventType, _ := payload["type"].(string); isAnthropicStreamEventType(eventType) {
+			eventType, _ := payload["type"].(string)
+			if isAnthropicStreamEventType(eventType) {
 				anthropic.merge(decodeAnthropicStreamEvent(data, eventType).usage)
+				return true
+			}
+			if isOpenAIStreamEventType(eventType) {
+				openai.merge(decodeOpenAIStreamEvent(data, eventType).usage)
 				return true
 			}
 			report.add(payload)
@@ -472,6 +478,9 @@ func ExtractUsage(rawBody []byte, contentType string) TokenUsage {
 		})
 		if anthropic.seen {
 			return anthropic.usage()
+		}
+		if openai.seen {
+			return openai.usage()
 		}
 		return report.usage()
 	}
@@ -501,6 +510,9 @@ func sseBytesLineHasVisibleToken(line []byte) bool {
 	}
 	if eventType, _ := payload["type"].(string); isAnthropicStreamEventType(eventType) {
 		return decodeAnthropicStreamEvent(data, eventType).visible
+	}
+	if isOpenAIChatChunk(eventType) {
+		return decodeOpenAIChatEvent(data).visible
 	}
 	return jsonHasVisibleToken(payload)
 }
@@ -550,6 +562,7 @@ type sseObservation struct {
 	terminalEventSeen       bool
 	usage                   usageReport
 	anthropicUsage          anthropicUsageFields
+	openaiUsage             openaiUsageFields
 	responseReasoningEffort *string
 	// streamError is the failure an error event reported, nil for a stream
 	// that ended normally. streamErrorFault says whether it blames the channel.
@@ -569,6 +582,9 @@ type sseObservation struct {
 func (o *sseObservation) tokenUsage() TokenUsage {
 	if o.anthropicUsage.seen {
 		return o.anthropicUsage.usage()
+	}
+	if o.openaiUsage.seen {
+		return o.openaiUsage.usage()
 	}
 	return o.usage.usage()
 }
@@ -604,9 +620,19 @@ func (o *sseObservation) observeLine(line []byte, elapsedMs func() int32) {
 	if err := json.Unmarshal([]byte(data), &payload); err != nil {
 		return
 	}
-	if eventType, _ := payload["type"].(string); isAnthropicStreamEventType(eventType) {
+	eventType, _ := payload["type"].(string)
+	if isAnthropicStreamEventType(eventType) {
 		event := decodeAnthropicStreamEvent([]byte(data), eventType)
 		o.anthropicUsage.merge(event.usage)
+		if event.finalUsage {
+			o.finalUsageSeen = true
+		}
+		o.outputEstimate += estimateDeltaTokens(payload)
+		return
+	}
+	if isOpenAIStreamEventType(eventType) {
+		event := decodeOpenAIStreamEvent([]byte(data), eventType)
+		o.openaiUsage.merge(event.usage)
 		if event.finalUsage {
 			o.finalUsageSeen = true
 		}
