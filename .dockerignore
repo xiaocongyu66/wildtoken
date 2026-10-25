@@ -1,6 +1,8 @@
 .git
+.github
 .opencode
 data
+target
 *.db
 *.db-shm
 *.db-wal

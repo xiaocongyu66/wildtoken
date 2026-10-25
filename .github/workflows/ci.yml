@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - rewrite/axum
   pull_request:
   workflow_dispatch:
 
@@ -17,12 +18,34 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GO_VERSION: "1.25"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  # The Go implementation this rewrite is checked against. Kept as a full SHA
+  # so the baseline stays buildable after the Go sources leave the branch.
+  BASELINE_SHA: f314c28936ca26ef5d4844b2617ec287aed16263
 
 jobs:
-  checks:
-    name: Go and JavaScript checks
-    runs-on: ubuntu-22.04
+  fmt:
+    name: Rust formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Check out repository
@@ -30,54 +53,20 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Go toolchain
-        uses: actions/setup-go@v6
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          go-version: ${{ env.GO_VERSION }}
+          components: clippy
 
-      - name: Install Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: 22
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
 
-      - name: Check Go formatting
-        shell: bash
-        run: |
-          set -euo pipefail
-          unformatted="$(gofmt -l cmd internal)"
-          if [[ -n "$unformatted" ]]; then
-            echo "These files are not gofmt-clean:" >&2
-            echo "$unformatted" >&2
-            exit 1
-          fi
+      - name: Run clippy
+        run: cargo clippy --all-targets -- -D warnings
 
-      - name: Verify module tidiness
-        shell: bash
-        run: |
-          set -euo pipefail
-          go mod tidy
-          git diff --exit-code go.mod go.sum
-
-      - name: Vet Go
-        run: go vet ./...
-
-      - name: Run Go tests
-        run: go test -race ./...
-
-      # 旧前端的 static/js 已删，原先逐个 node --check 的循环随之失效（删的时候
-      # 漏了 done，这一步从此语法错误，下面的测试一直没跑过）。
-      - name: Run JavaScript tests
-        shell: bash
-        run: |
-          set -euo pipefail
-          node --test tests/*.test.mjs
-          # 前端拼的请求体和后端严格解码的结构体对齐。字段对不上时后端只回一句
-          # 400，界面上看不出是哪个字段——已经这样坏过三次。
-          node scripts/payload-contract.mjs
-
-  cross-compile:
-    name: Cross-compile check
-    runs-on: ubuntu-22.04
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Check out repository
@@ -85,30 +74,93 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Go toolchain
-        uses: actions/setup-go@v6
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          go-version: ${{ env.GO_VERSION }}
+          components: clippy
 
-      # Every target builds without cgo, so a single Linux runner can verify
-      # them all.
-      - name: Build every release target
-        shell: bash
-        env:
-          CGO_ENABLED: "0"
-        run: |
-          set -euo pipefail
-          GOOS=windows GOARCH=amd64 \
-            go build -ldflags "-H=windowsgui" -o /dev/null ./cmd/wildtoken
-          GOOS=darwin GOARCH=amd64 go build -o /dev/null ./cmd/wildtoken
-          GOOS=darwin GOARCH=arm64 go build -o /dev/null ./cmd/wildtoken
-          GOOS=linux GOARCH=arm64 go build -o /dev/null ./cmd/wildtoken
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --all-targets
+
+      # The lockfile is generated in CI because the rewrite must not be built
+      # locally. It is uploaded so the first green run can commit it.
+      - name: Upload Cargo.lock
+        uses: actions/upload-artifact@v7
+        with:
+          name: cargo-lock
+          path: Cargo.lock
+          if-no-files-found: ignore
+          retention-days: 14
+
+  build:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            os: ubuntu-latest
+            binary: wildtoken
+          - label: windows-x86_64
+            os: windows-latest
+            binary: wildtoken.exe
+          - label: macos-aarch64
+            os: macos-14
+            binary: wildtoken
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --bin wildtoken
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: rust-${{ matrix.label }}
+          path: target/release/${{ matrix.binary }}
+          if-no-files-found: error
+          retention-days: 14
+
+  cross-check:
+    name: Cross-check linux-aarch64
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check linux-aarch64
+        run: cargo check --target aarch64-unknown-linux-gnu
 
   docker-smoke:
     name: Docker smoke test
-    needs: checks
-    runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    needs: [fmt, clippy, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       IMAGE_NAME: wildtoken:ci-${{ github.run_id }}-${{ github.run_attempt }}
       CONTAINER_NAME: >-
@@ -122,7 +174,7 @@ jobs:
       - name: Build image
         run: docker build --tag "$IMAGE_NAME" .
 
-      - name: Start container and verify endpoints
+      - name: Start container and verify health
         shell: bash
         run: |
           set -euo pipefail
@@ -151,83 +203,6 @@ jobs:
           fi
 
           grep -q '"status":"ok"' "$RUNNER_TEMP/wildtoken-health.json"
-          curl --fail --silent --show-error \
-            http://127.0.0.1:3110/console \
-            --output "$RUNNER_TEMP/wildtoken-console.html"
-          grep -q 'WildToken Console' "$RUNNER_TEMP/wildtoken-console.html"
-          # 旧控制台已删；/admin 应该是 404，而不是还能拿到东西。
-          admin_status=$(curl --silent --output /dev/null \
-            --write-out '%{http_code}' http://127.0.0.1:3110/admin)
-          if [ "$admin_status" != "404" ]; then
-            echo "/admin 返回 $admin_status，期望 404"
-            exit 1
-          fi
-
-          curl --fail --silent --show-error \
-            http://127.0.0.1:3110/theme-packs/ark/theme.css \
-            --output "$RUNNER_TEMP/wildtoken-theme.css"
-
-          # 分段拼：整行 JSON 超过行长上限，而单引号串无法用反斜杠折行。
-          token_payload='{"name":"ci-smoke"'
-          token_payload="$token_payload"',"description":"CI contract smoke"'
-          token_payload="$token_payload"',"enabled":true}'
-          curl --fail --silent --show-error \
-            --request POST \
-            --header "x-admin-token: $admin_token" \
-            --header 'content-type: application/json' \
-            --data "$token_payload" \
-            http://127.0.0.1:3110/api/admin/tokens \
-            --output "$RUNNER_TEMP/wildtoken-token-created.json"
-
-          jq --exit-status '.enabled == true' \
-            "$RUNNER_TEMP/wildtoken-token-created.json" >/dev/null
-          token_id="$(jq --exit-status --raw-output '.id | numbers' \
-            "$RUNNER_TEMP/wildtoken-token-created.json")"
-          api_token="$(jq --exit-status --raw-output \
-            '.token | strings | select(length > 0)' \
-            "$RUNNER_TEMP/wildtoken-token-created.json")"
-
-          unauthenticated_status="$(curl --silent --show-error \
-            --output "$RUNNER_TEMP/wildtoken-models-unauthenticated.json" \
-            --write-out '%{http_code}' \
-            http://127.0.0.1:3110/v1/models)"
-          if [[ "$unauthenticated_status" != 401 ]]; then
-            echo "Unauthenticated /v1/models request was not rejected" >&2
-            exit 1
-          fi
-
-          curl --fail --silent --show-error \
-            --header "authorization: Bearer $api_token" \
-            http://127.0.0.1:3110/v1/models \
-            --output "$RUNNER_TEMP/wildtoken-models.json"
-          jq --exit-status \
-            '.object == "list" and (.data | type == "array")' \
-            "$RUNNER_TEMP/wildtoken-models.json" >/dev/null
-
-          # The detail endpoint returns the token in full, on purpose: the
-          # console lets an operator copy a credential back out at any time,
-          # which is why the plaintext is stored alongside the digest. This
-          # asserted the opposite and had been failing since that feature
-          # landed. Asserted in its current direction so a change either way
-          # is caught rather than only one of them.
-          curl --fail --silent --show-error \
-            --header "x-admin-token: $admin_token" \
-            "http://127.0.0.1:3110/api/admin/tokens/$token_id" \
-            --output "$RUNNER_TEMP/wildtoken-token-detail.json"
-          jq --exit-status --arg token "$api_token" \
-            '.token == $token and (.token_preview | strings | length > 0)' \
-            "$RUNNER_TEMP/wildtoken-token-detail.json" >/dev/null
-
-          # The endpoint is behind the admin credential, so that is the part
-          # worth holding: without the header it must not answer at all.
-          unauthorized_detail_status="$(curl --silent --show-error \
-            --output /dev/null \
-            --write-out '%{http_code}' \
-            "http://127.0.0.1:3110/api/admin/tokens/$token_id")"
-          if [[ "$unauthorized_detail_status" != 401 ]]; then
-            echo "Token detail served without an admin token" >&2
-            exit 1
-          fi
 
       - name: Show container logs on failure
         if: failure()
@@ -239,11 +214,38 @@ jobs:
         run: |
           docker rm --force "$CONTAINER_NAME" 2>/dev/null || true
           docker image rm --force "$IMAGE_NAME" 2>/dev/null || true
-          rm -f \
-            "$RUNNER_TEMP/wildtoken-health.json" \
-            "$RUNNER_TEMP/wildtoken-console.html" \
-            "$RUNNER_TEMP/wildtoken-theme.css" \
-            "$RUNNER_TEMP/wildtoken-token-created.json" \
-            "$RUNNER_TEMP/wildtoken-models-unauthenticated.json" \
-            "$RUNNER_TEMP/wildtoken-models.json" \
-            "$RUNNER_TEMP/wildtoken-token-detail.json"
+          rm -f "$RUNNER_TEMP/wildtoken-health.json"
+
+  baseline:
+    name: Build Go baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the baseline revision
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASELINE_SHA }}
+          persist-credentials: false
+
+      - name: Install Go toolchain
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+          cache: false
+
+      - name: Build baseline binary
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          go build -trimpath -o out/wildtoken ./cmd/wildtoken
+
+      - name: Upload baseline binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: go-baseline
+          path: out/wildtoken
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,63 @@
+name: Format
+
+# Formatting is applied in CI because this rewrite must not be built locally.
+# Trigger it on a branch, and it commits any rustfmt changes back to that
+# branch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch to format
+        required: true
+        default: rewrite/axum
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: format-${{ inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  format:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Refuse to rewrite main
+        shell: bash
+        run: |
+          if [[ "${{ inputs.ref }}" == "main" ]]; then
+            echo "refusing to format main automatically" >&2
+            exit 1
+          fi
+
+      - name: Check out the target branch
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Commit formatting changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "already formatted"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "style: cargo fmt"
+          git push origin "HEAD:${{ inputs.ref }}"

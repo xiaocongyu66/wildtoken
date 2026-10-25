@@ -13,21 +13,15 @@ RUN npm ci
 COPY web/ ./
 RUN npm run build
 
-# ── Build stage ──────────────────────────────────────────────────────────────
-FROM golang:1.25-bookworm AS builder
+# ── Rust build stage ─────────────────────────────────────────────────────────
+FROM rust:bookworm AS builder
 
 WORKDIR /src
 
-# Cache module downloads when only application sources change.
-COPY go.mod go.sum ./
-RUN go mod download
+COPY Cargo.toml ./
+COPY src ./src
 
-COPY cmd ./cmd
-COPY internal ./internal
-
-# CGO stays off: the SQLite driver is pure Go, so the runtime image needs no
-# SQLite library and the binary is portable across glibc versions.
-RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/wildtoken ./cmd/wildtoken
+RUN cargo build --release --bin wildtoken
 
 # ── Runtime stage ────────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
@@ -46,7 +40,7 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY --from=builder /out/wildtoken /usr/local/bin/wildtoken
+COPY --from=builder /src/target/release/wildtoken /usr/local/bin/wildtoken
 COPY static ./static
 COPY config ./config
 
