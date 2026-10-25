@@ -1,39 +1,16 @@
 //! WildToken — Rust rewrite on axum + Tokio.
-//!
-//! Milestone 0 serves the health endpoint only; the rest of the surface is
-//! ported milestone by milestone.
 
 use std::net::SocketAddr;
 use std::process::ExitCode;
+use std::sync::Arc;
 
-use axum::routing::get;
-use axum::{Json, Router};
-use serde_json::json;
-use serde_json::Value;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
-const DEFAULT_HOST: &str = "127.0.0.1";
-const DEFAULT_PORT: u16 = 3100;
+use wildtoken::{config, routes, state};
 
-fn app() -> Router {
-    Router::new().route("/health", get(health))
-}
-
-async fn health() -> Json<Value> {
-    Json(json!({"status": "ok", "service": "WildToken"}))
-}
-
-async fn bind_address() -> Result<SocketAddr, String> {
-    let host = std::env::var("APP__SERVER__HOST").unwrap_or_else(|_| DEFAULT_HOST.to_string());
-    let port = match std::env::var("APP__SERVER__PORT") {
-        Ok(value) => value
-            .parse::<u16>()
-            .map_err(|_| format!("invalid APP__SERVER__PORT: {value}"))?,
-        Err(_) => DEFAULT_PORT,
-    };
-
-    let mut addresses = tokio::net::lookup_host((host.as_str(), port))
+async fn bind_address(host: &str, port: u16) -> Result<SocketAddr, String> {
+    let mut addresses = tokio::net::lookup_host((host, port))
         .await
         .map_err(|error| format!("could not resolve {host}:{port}: {error}"))?;
     addresses
@@ -48,7 +25,7 @@ async fn shutdown_signal() {
 
     #[cfg(unix)]
     let terminate = async {
-        use tokio::signal::unix::{SignalKind, signal};
+        use tokio::signal::unix::{signal, SignalKind};
         if let Ok(mut stream) = signal(SignalKind::terminate()) {
             stream.recv().await;
         }
@@ -70,7 +47,23 @@ async fn main() -> ExitCode {
         .with_env_filter(EnvFilter::new(filter))
         .init();
 
-    let address = match bind_address().await {
+    let settings = match config::load() {
+        Ok(settings) => settings,
+        Err(error) => {
+            tracing::error!(%error, "could not load configuration");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let state = match state::build(settings.clone()).await {
+        Ok(state) => Arc::new(state),
+        Err(error) => {
+            tracing::error!(%error, "could not start WildToken");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let address = match bind_address(&settings.server.host, settings.server.port).await {
         Ok(address) => address,
         Err(error) => {
             tracing::error!(%error, "could not resolve the listen address");
@@ -89,9 +82,13 @@ async fn main() -> ExitCode {
     let local = listener.local_addr().unwrap_or(address);
     tracing::info!(%local, "WildToken starting");
 
-    match axum::serve(listener, app())
-        .with_graceful_shutdown(shutdown_signal())
-        .await
+    let app = routes::router(state);
+    match axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
     {
         Ok(()) => {
             tracing::info!("WildToken stopped");

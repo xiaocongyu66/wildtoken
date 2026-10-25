@@ -1,8 +1,14 @@
 //! SQLite access with an explicit connection pool and `BEGIN IMMEDIATE`
 //! transactions.
 
+pub mod admin;
+pub mod groups;
+pub mod prompts;
 pub mod schema;
+pub mod settings;
+pub mod stats;
 pub mod token;
+pub mod tokens;
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -160,6 +166,12 @@ impl Db {
         ))?;
         Ok(connection)
     }
+}
+
+/// Reports a UNIQUE constraint failure, which the console should see as a bad
+/// request rather than an internal error.
+pub fn is_unique_violation(error: &ApiError) -> bool {
+    error.message.to_uppercase().contains("UNIQUE")
 }
 
 /// Extracts the file path from `sqlite:` / `sqlite://` URLs.

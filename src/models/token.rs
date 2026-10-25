@@ -5,7 +5,7 @@ use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
 use time::{OffsetDateTime, PrimitiveDateTime, UtcOffset};
 
-use crate::models::quota::parse_quota_expression;
+use crate::models::quota::{parse_quota_expression, QuotaState};
 use crate::ratelimit::parse_rate_limit;
 
 pub const APITOKEN_NAME_MAX_CHARS: usize = 80;
@@ -152,29 +152,41 @@ pub struct APITokenRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct APITokenIn {
     pub name: String,
-    #[serde(default)]
     pub description: String,
     /// `None` means "generate one".
-    #[serde(default)]
     pub token: Option<String>,
-    #[serde(default)]
     pub enabled: bool,
-    #[serde(default)]
     pub expires_at: Option<String>,
-    #[serde(default)]
     pub group_id: Option<i64>,
-    #[serde(default)]
     pub limit_expression: String,
-    #[serde(default)]
     pub rate_limit: Option<String>,
-    #[serde(default)]
     pub allowed_models: Vec<String>,
 }
 
+impl Default for APITokenIn {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            description: String::new(),
+            token: None,
+            // The console's create form leaves `enabled` out, meaning enabled.
+            enabled: true,
+            expires_at: None,
+            group_id: None,
+            limit_expression: String::new(),
+            rate_limit: None,
+            allowed_models: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct APITokenUpdateIn {
+    #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub description: String,
@@ -193,6 +205,99 @@ pub struct APITokenUpdateIn {
     pub allowed_models: Vec<String>,
     #[serde(default)]
     pub enabled: Option<bool>,
+}
+
+impl Default for APITokenUpdateIn {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            description: String::new(),
+            expires_at: None,
+            group_id: None,
+            token: None,
+            limit_expression: String::new(),
+            rate_limit: None,
+            allowed_models: Vec::new(),
+            enabled: None,
+        }
+    }
+}
+
+/// Carries the full token value so the console can hand it back to its owner.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct APITokenOut {
+    pub id: i64,
+    pub name: String,
+    pub description: String,
+    pub token: String,
+    pub token_preview: String,
+    pub enabled: bool,
+    pub expires_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub group_id: i64,
+    pub group_name: String,
+    pub quota: QuotaState,
+    pub rate_limit: Option<String>,
+    pub allowed_models: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct APITokenCreatedOut {
+    pub id: i64,
+    pub name: String,
+    pub description: String,
+    pub token: String,
+    pub token_preview: String,
+    pub enabled: bool,
+    pub expires_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub group_id: i64,
+    pub group_name: String,
+    pub quota: QuotaState,
+    pub rate_limit: Option<String>,
+    pub allowed_models: Vec<String>,
+}
+
+impl From<&APITokenOut> for APITokenCreatedOut {
+    fn from(value: &APITokenOut) -> Self {
+        Self {
+            id: value.id,
+            name: value.name.clone(),
+            description: value.description.clone(),
+            token: value.token.clone(),
+            token_preview: value.token_preview.clone(),
+            enabled: value.enabled,
+            expires_at: value.expires_at.clone(),
+            created_at: value.created_at.clone(),
+            updated_at: value.updated_at.clone(),
+            group_id: value.group_id,
+            group_name: value.group_name.clone(),
+            quota: value.quota.clone(),
+            rate_limit: value.rate_limit.clone(),
+            allowed_models: value.allowed_models.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TokenEnabledIn {
+    pub enabled: Option<bool>,
+}
+
+impl Default for TokenEnabledIn {
+    fn default() -> Self {
+        Self { enabled: None }
+    }
+}
+
+impl TokenEnabledIn {
+    pub fn value(&self) -> Result<bool, String> {
+        self.enabled
+            .ok_or_else(|| "enabled is required".to_string())
+    }
 }
 
 /// The fields a replacing edit must carry as values.

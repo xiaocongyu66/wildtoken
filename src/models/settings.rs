@@ -208,6 +208,202 @@ pub fn validate_proxy_url(value: &str, enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// The editable policy payload; every field is required by the console.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RuntimeSettingsIn {
+    pub log_body_keep_count: i64,
+    pub log_retention_days: i64,
+    pub log_body_max_bytes: i64,
+    pub max_retries: i64,
+    pub same_upstream_retry_interval_ms: i64,
+    pub auto_weight_failure_penalty: i64,
+    pub auto_weight_success_increment: i64,
+    pub auto_weight_recovery_increment: i64,
+    pub auto_weight_recovery_interval_seconds: i64,
+    pub proxy_enabled: bool,
+    pub proxy_url: String,
+    pub default_upstream_timeout_seconds: i64,
+    pub image_storage_max_mb: i64,
+    pub dashboard_multiplier: f64,
+    pub revision: i64,
+}
+
+impl RuntimeSettingsIn {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.revision < 1 {
+            return Err("revision must be at least 1".to_string());
+        }
+        let candidate = RuntimeSettings {
+            log_body_keep_count: self.log_body_keep_count,
+            log_retention_days: self.log_retention_days,
+            log_body_max_bytes: self.log_body_max_bytes,
+            max_retries: self.max_retries,
+            same_upstream_retry_interval_ms: self.same_upstream_retry_interval_ms,
+            auto_weight_failure_penalty: self.auto_weight_failure_penalty,
+            auto_weight_success_increment: self.auto_weight_success_increment,
+            auto_weight_recovery_increment: self.auto_weight_recovery_increment,
+            auto_weight_recovery_interval_seconds: self.auto_weight_recovery_interval_seconds,
+            proxy_enabled: self.proxy_enabled,
+            proxy_url: self.proxy_url.clone(),
+            default_upstream_timeout_seconds: self.default_upstream_timeout_seconds,
+            image_storage_max_mb: self.image_storage_max_mb,
+            dashboard_multiplier: self.dashboard_multiplier,
+            revision: self.revision,
+            updated_at: String::new(),
+            database_override: false,
+        };
+        candidate.validate()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RuntimeSettingsOut {
+    pub log_body_keep_count: i64,
+    pub log_retention_days: i64,
+    pub log_body_max_bytes: i64,
+    pub max_retries: i64,
+    pub same_upstream_retry_interval_ms: i64,
+    pub auto_weight_failure_penalty: i64,
+    pub auto_weight_success_increment: i64,
+    pub auto_weight_recovery_increment: i64,
+    pub auto_weight_recovery_interval_seconds: i64,
+    pub proxy_enabled: bool,
+    pub proxy_url: String,
+    pub default_upstream_timeout_seconds: i64,
+    pub image_storage_max_mb: i64,
+    pub dashboard_multiplier: f64,
+    pub revision: i64,
+    pub updated_at: String,
+    pub database_override: bool,
+}
+
+impl RuntimeSettingsOut {
+    pub fn from_settings(settings: &RuntimeSettings) -> Self {
+        Self {
+            log_body_keep_count: settings.log_body_keep_count,
+            log_retention_days: settings.log_retention_days,
+            log_body_max_bytes: settings.log_body_max_bytes,
+            max_retries: settings.max_retries,
+            same_upstream_retry_interval_ms: settings.same_upstream_retry_interval_ms,
+            auto_weight_failure_penalty: settings.auto_weight_failure_penalty,
+            auto_weight_success_increment: settings.auto_weight_success_increment,
+            auto_weight_recovery_increment: settings.auto_weight_recovery_increment,
+            auto_weight_recovery_interval_seconds: settings.auto_weight_recovery_interval_seconds,
+            proxy_enabled: settings.proxy_enabled,
+            proxy_url: settings.proxy_url.clone(),
+            default_upstream_timeout_seconds: settings.default_upstream_timeout_seconds,
+            image_storage_max_mb: settings.image_storage_max_mb,
+            dashboard_multiplier: settings.dashboard_multiplier,
+            revision: settings.revision,
+            updated_at: settings.updated_at.clone(),
+            database_override: settings.database_override,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AdminTokenRotateIn {
+    pub confirm: bool,
+    pub token: String,
+}
+
+impl AdminTokenRotateIn {
+    pub fn validated_token(&self) -> Result<String, String> {
+        validate_admin_token_value(&self.token, ADMIN_TOKEN_ROTATE_MIN_LEN)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ModelTestPromptTemplate {
+    pub id: i64,
+    pub name: String,
+    pub prompt: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModelTestPromptTemplateIn {
+    pub name: String,
+    pub prompt: String,
+}
+
+impl ModelTestPromptTemplateIn {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.name.trim().is_empty() || self.name.chars().count() > 80 {
+            return Err("prompt template name must be between 1 and 80 characters".to_string());
+        }
+        if self.prompt.trim().is_empty() || self.prompt.len() > 20_000 {
+            return Err("prompt template prompt must be between 1 and 20000 bytes".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RuntimeLogSettingsSummary {
+    pub log_body_keep_count: i64,
+    pub log_retention_days: i64,
+    pub log_body_max_bytes: i64,
+    pub revision: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RuntimeCleanupMetricsOut {
+    pub active: bool,
+    pub runs_total: u64,
+    pub errors_total: u64,
+    pub rows_cleared_total: u64,
+    pub batches_total: u64,
+    pub current_rows_cleared: u64,
+    pub current_batches: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_started_unix_seconds: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_finished_unix_seconds: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_duration_ms: Option<u64>,
+    pub last_rows_cleared: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RuntimeMetricsOut {
+    pub active_sse_streams: u64,
+    pub sse_completed_total: u64,
+    pub sse_client_disconnects_total: u64,
+    pub sse_recent_disconnects_10m: u64,
+    pub sse_upstream_errors_total: u64,
+    pub log_queue_depth: u64,
+    pub log_written_total: u64,
+    pub log_write_batches_total: u64,
+    pub log_dropped_total: u64,
+    pub log_write_failures_total: u64,
+    pub slow_db_operations_total: u64,
+    pub cleanup: RuntimeCleanupMetricsOut,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SystemInfoOut {
+    pub service: String,
+    pub version: String,
+    pub default_upstream_timeout_seconds: f64,
+    pub uptime_seconds: u64,
+    pub current_server_time: String,
+    pub database_ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database_allocated_bytes: Option<i64>,
+    pub total_log_count: i64,
+    pub log_count_24h: i64,
+    pub enabled_upstream_count: i64,
+    pub total_upstream_count: i64,
+    pub recent_one_minute_log_count: i64,
+    pub runtime_log_settings: RuntimeLogSettingsSummary,
+    pub runtime_metrics: RuntimeMetricsOut,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

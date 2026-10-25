@@ -21,10 +21,10 @@ pub struct Group {
     pub is_default: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct GroupIn {
     pub name: String,
-    #[serde(default)]
     pub description: String,
 }
 
