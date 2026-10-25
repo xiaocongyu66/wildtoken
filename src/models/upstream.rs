@@ -335,7 +335,7 @@ pub struct ExportUpstreamsRequest {
     pub include_api_keys: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChannelExportItem {
     pub name: String,
@@ -362,6 +362,31 @@ pub struct ChannelExportItem {
     pub archived: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled_before_archive: Option<bool>,
+}
+
+impl Default for ChannelExportItem {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            base_url: String::new(),
+            api_key: None,
+            model_names: Vec::new(),
+            model_prefixes: Vec::new(),
+            model_mappings: std::collections::BTreeMap::new(),
+            effort_mappings: None,
+            priority: 100,
+            weight: 100,
+            auto_weight_enabled: true,
+            enabled: true,
+            extra_headers: std::collections::BTreeMap::new(),
+            timeout_seconds: None,
+            rate_limit: None,
+            group_ids: Vec::new(),
+            group_names: None,
+            archived: None,
+            enabled_before_archive: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
