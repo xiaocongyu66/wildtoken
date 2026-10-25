@@ -18,10 +18,10 @@ FROM rust:bookworm AS builder
 
 WORKDIR /src
 
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
-RUN cargo build --release --bin wildtoken
+RUN cargo build --locked --release --bin wildtoken
 
 # ── Runtime stage ────────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
