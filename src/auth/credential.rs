@@ -76,10 +76,8 @@ pub fn verify_admin_token(encoded: &str, token: &str) -> bool {
         return false;
     };
     if time < 1
-        || threads < 1
-        || threads > MAX_THREADS
-        || memory < MIN_MEMORY_KIB
-        || memory > MAX_MEMORY_KIB
+        || !(1..=MAX_THREADS).contains(&threads)
+        || !(MIN_MEMORY_KIB..=MAX_MEMORY_KIB).contains(&memory)
     {
         return false;
     }

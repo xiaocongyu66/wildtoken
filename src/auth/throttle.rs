@@ -201,21 +201,15 @@ impl Throttle {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let has_room = prune(&mut clients, now);
-        if !clients.contains_key(&addr) {
-            if !has_room {
-                // Every slot is held by a client still being penalised.
-                return;
-            }
-            clients.insert(
-                addr,
-                ClientState {
-                    failures: 0,
-                    blocked_until: None,
-                    last_failure: now,
-                },
-            );
+        if !has_room && !clients.contains_key(&addr) {
+            // Every slot is held by a client still being penalised.
+            return;
         }
-        let state = clients.get_mut(&addr).expect("inserted above");
+        let state = clients.entry(addr).or_insert(ClientState {
+            failures: 0,
+            blocked_until: None,
+            last_failure: now,
+        });
 
         if now.saturating_duration_since(state.last_failure) >= CLIENT_RESET_AFTER {
             state.failures = 0;
@@ -247,11 +241,14 @@ fn backoff(failures: u32, now: Instant) -> Option<Instant> {
         return None;
     }
     let exponent = failures - FREE_ATTEMPTS - 1;
+    let base_millis = BASE_BACKOFF.as_millis() as u64;
     let delay = if exponent >= 63 {
         MAX_BACKOFF
     } else {
-        let seconds = 1u64.checked_shl(exponent).unwrap_or(u64::MAX);
-        Duration::from_secs(seconds).min(MAX_BACKOFF)
+        base_millis
+            .checked_shl(exponent)
+            .map(|millis| Duration::from_millis(millis).min(MAX_BACKOFF))
+            .unwrap_or(MAX_BACKOFF)
     };
     Some(now + delay)
 }

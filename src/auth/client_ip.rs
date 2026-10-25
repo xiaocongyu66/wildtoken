@@ -1,6 +1,6 @@
 //! Resolving the caller's address for throttling and logging.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use crate::auth::throttle::Client;
 
