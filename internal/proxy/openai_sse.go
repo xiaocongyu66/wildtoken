@@ -136,7 +136,7 @@ func decodeOpenAIResponseEvent(data []byte) openaiEvent {
 	}
 	result := openaiEvent{matched: true}
 	if event.Type == "response.completed" && event.JSON.Response.Valid() {
-		result.usage = usageFromResponse(event.Response)
+		result.usage = usageFromResponse(event.Response.Usage)
 		result.finalUsage = result.usage.seen
 	}
 	return result
