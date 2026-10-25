@@ -9,6 +9,7 @@ pub mod settings;
 pub mod stats;
 pub mod token;
 pub mod tokens;
+pub mod upstreams;
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};

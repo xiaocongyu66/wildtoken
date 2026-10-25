@@ -76,6 +76,32 @@ pub fn router(state: SharedState) -> Router {
                 .put(admin::update_group)
                 .delete(admin::delete_group),
         )
+        .route(
+            "/upstreams",
+            get(admin::list_upstreams).post(admin::create_upstream),
+        )
+        .route(
+            "/upstreams/",
+            get(admin::list_upstreams).post(admin::create_upstream),
+        )
+        .route(
+            "/upstreams/{id}",
+            get(admin::get_upstream)
+                .put(admin::update_upstream)
+                .delete(admin::delete_upstream),
+        )
+        .route(
+            "/upstreams/{id}/enabled",
+            patch(admin::set_upstream_enabled),
+        )
+        .route(
+            "/upstreams/{id}/archived",
+            patch(admin::set_upstream_archived),
+        )
+        .route(
+            "/upstreams/{id}/priority",
+            patch(admin::set_upstream_priority),
+        )
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin));
 

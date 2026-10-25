@@ -19,6 +19,10 @@ use crate::models::settings::{
     SystemInfoOut,
 };
 use crate::models::token::{APITokenIn, TokenEnabledIn};
+use crate::models::upstream::{
+    missing_upstream_fields, UpstreamArchivedIn, UpstreamDetailOut, UpstreamEnabledIn, UpstreamIn,
+    UpstreamOut, UpstreamPriorityIn, UpstreamUpdate,
+};
 use crate::routes::{decode_body, decode_token_update, parse_id, AdminAuth, SharedState};
 
 pub async fn get_settings(State(state): State<SharedState>) -> Result<Response, ApiError> {
@@ -326,5 +330,207 @@ pub async fn delete_group(
         Ok(StatusCode::NO_CONTENT.into_response())
     } else {
         Err(ApiError::not_found("group not found"))
+    }
+}
+
+fn upstream_out(row: &db::upstreams::UpstreamRow, group_ids: Vec<i64>) -> UpstreamOut {
+    let archived = row.archived == 1;
+    UpstreamOut {
+        id: row.id,
+        name: row.name.clone(),
+        base_url: row.base_url.clone(),
+        api_key_set: row.api_key.is_some(),
+        model_names: db::upstreams::decode_vec(&row.model_names),
+        model_prefixes: db::upstreams::decode_vec(&row.model_prefixes),
+        model_mappings: db::upstreams::decode_map(&row.model_mappings),
+        effort_mappings: db::upstreams::decode_map(&row.effort_mappings),
+        priority: row.priority,
+        weight: row.weight,
+        auto_weight_enabled: row.auto_weight_enabled == 1,
+        enabled: row.enabled == 1,
+        archived,
+        extra_headers: db::upstreams::decode_map(&row.extra_headers),
+        timeout_seconds: row.timeout_seconds,
+        rate_limit: row.rate_limit.clone(),
+        created_at: row.created_at.clone(),
+        updated_at: row.updated_at.clone(),
+        runtime_health_score: 0,
+        effective_weight: row.weight as f64,
+        health_recovery_remaining_seconds: None,
+        group_ids,
+        enabled_before_archive: if archived {
+            row.archived_prev_enabled.map(|value| value == 1)
+        } else {
+            None
+        },
+    }
+}
+
+fn upstream_detail(row: &db::upstreams::UpstreamRow, group_ids: Vec<i64>) -> UpstreamDetailOut {
+    let archived = row.archived == 1;
+    UpstreamDetailOut {
+        id: row.id,
+        name: row.name.clone(),
+        base_url: row.base_url.clone(),
+        api_key: row.api_key.clone(),
+        api_key_set: row.api_key.is_some(),
+        model_names: db::upstreams::decode_vec(&row.model_names),
+        model_prefixes: db::upstreams::decode_vec(&row.model_prefixes),
+        model_mappings: db::upstreams::decode_map(&row.model_mappings),
+        effort_mappings: db::upstreams::decode_map(&row.effort_mappings),
+        priority: row.priority,
+        weight: row.weight,
+        auto_weight_enabled: row.auto_weight_enabled == 1,
+        enabled: row.enabled == 1,
+        extra_headers: db::upstreams::decode_map(&row.extra_headers),
+        timeout_seconds: row.timeout_seconds,
+        rate_limit: row.rate_limit.clone(),
+        created_at: row.created_at.clone(),
+        updated_at: row.updated_at.clone(),
+        runtime_health_score: 0,
+        effective_weight: row.weight as f64,
+        health_recovery_remaining_seconds: None,
+        group_ids,
+        archived,
+        enabled_before_archive: if archived {
+            row.archived_prev_enabled.map(|value| value == 1)
+        } else {
+            None
+        },
+    }
+}
+
+async fn full_detail(
+    state: &crate::routes::SharedState,
+    row: db::upstreams::UpstreamRow,
+) -> Result<UpstreamDetailOut, ApiError> {
+    let group_ids = db::upstreams::list_group_ids(&state.db, row.id).await?;
+    Ok(upstream_detail(&row, group_ids))
+}
+
+pub async fn list_upstreams(State(state): State<SharedState>) -> Result<Response, ApiError> {
+    let rows = db::upstreams::list_upstreams(&state.db).await?;
+    let mut upstreams = Vec::with_capacity(rows.len());
+    for row in rows {
+        let group_ids = db::upstreams::list_group_ids(&state.db, row.id).await?;
+        upstreams.push(upstream_out(&row, group_ids));
+    }
+    Ok(Json(upstreams).into_response())
+}
+
+pub async fn get_upstream(
+    State(state): State<SharedState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    let id = parse_id(&id)?;
+    let row = db::upstreams::get_upstream(&state.db, id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("upstream not found"))?;
+    Ok(Json(full_detail(&state, row).await?).into_response())
+}
+
+pub async fn create_upstream(
+    State(state): State<SharedState>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let mut input: UpstreamIn = decode_body(&body)?;
+    input.validate().map_err(ApiError::bad_request)?;
+    let row = db::upstreams::create_upstream(&state.db, input)
+        .await
+        .map_err(|error| {
+            if db::is_unique_violation(&error) {
+                ApiError::bad_request("channel name already exists")
+            } else {
+                error
+            }
+        })?;
+    Ok((StatusCode::CREATED, Json(full_detail(&state, row).await?)).into_response())
+}
+
+pub async fn update_upstream(
+    State(state): State<SharedState>,
+    AxumPath(id): AxumPath<String>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let id = parse_id(&id)?;
+    let value: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|error| ApiError::bad_request(format!("invalid request body: {error}")))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| ApiError::bad_request("invalid request body: expected a JSON object"))?;
+    let missing = missing_upstream_fields(object);
+    if !missing.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "missing fields: {}",
+            missing.join(", ")
+        )));
+    }
+    let mut update: UpstreamUpdate = serde_json::from_value(value)
+        .map_err(|error| ApiError::bad_request(format!("invalid request body: {error}")))?;
+    update.input.validate().map_err(ApiError::bad_request)?;
+
+    let row = db::upstreams::update_upstream(&state.db, id, update)
+        .await
+        .map_err(|error| {
+            if db::is_unique_violation(&error) {
+                ApiError::bad_request("channel name already exists")
+            } else {
+                error
+            }
+        })?;
+    Ok(Json(full_detail(&state, row).await?).into_response())
+}
+
+pub async fn set_upstream_enabled(
+    State(state): State<SharedState>,
+    AxumPath(id): AxumPath<String>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let id = parse_id(&id)?;
+    let input: UpstreamEnabledIn = decode_body(&body)?;
+    let enabled = input.value().map_err(ApiError::bad_request)?;
+    let row = db::upstreams::set_enabled(&state.db, id, enabled)
+        .await?
+        .ok_or_else(|| ApiError::not_found("upstream not found"))?;
+    Ok(Json(full_detail(&state, row).await?).into_response())
+}
+
+pub async fn set_upstream_archived(
+    State(state): State<SharedState>,
+    AxumPath(id): AxumPath<String>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let id = parse_id(&id)?;
+    let input: UpstreamArchivedIn = decode_body(&body)?;
+    let archived = input.value().map_err(ApiError::bad_request)?;
+    let row = db::upstreams::set_archived(&state.db, id, archived)
+        .await?
+        .ok_or_else(|| ApiError::not_found("upstream not found"))?;
+    Ok(Json(full_detail(&state, row).await?).into_response())
+}
+
+pub async fn set_upstream_priority(
+    State(state): State<SharedState>,
+    AxumPath(id): AxumPath<String>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let id = parse_id(&id)?;
+    let input: UpstreamPriorityIn = decode_body(&body)?;
+    let priority = input.value().map_err(ApiError::bad_request)?;
+    let row = db::upstreams::set_priority(&state.db, id, priority)
+        .await?
+        .ok_or_else(|| ApiError::not_found("upstream not found"))?;
+    Ok(Json(full_detail(&state, row).await?).into_response())
+}
+
+pub async fn delete_upstream(
+    State(state): State<SharedState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    let id = parse_id(&id)?;
+    if db::upstreams::delete_upstream(&state.db, id).await? {
+        Ok(StatusCode::NO_CONTENT.into_response())
+    } else {
+        Err(ApiError::not_found("upstream not found"))
     }
 }

@@ -5,3 +5,4 @@ pub mod quota;
 pub mod route;
 pub mod settings;
 pub mod token;
+pub mod upstream;
