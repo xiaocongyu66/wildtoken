@@ -193,11 +193,15 @@ mod tests {
 
     #[test]
     fn bounds_are_enforced() {
-        let mut settings = RuntimeSettings::default();
-        settings.max_retries = 6;
+        let settings = RuntimeSettings {
+            max_retries: 6,
+            ..RuntimeSettings::default()
+        };
         assert!(settings.validate().is_err());
-        settings = RuntimeSettings::default();
-        settings.dashboard_multiplier = f64::NAN;
+        let settings = RuntimeSettings {
+            dashboard_multiplier: f64::NAN,
+            ..RuntimeSettings::default()
+        };
         assert!(settings.validate().is_err());
     }
 
