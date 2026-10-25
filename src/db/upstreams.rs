@@ -6,7 +6,7 @@ use serde::Serialize;
 
 use crate::db::{is_unique_violation, Db};
 use crate::error::ApiError;
-use crate::models::upstream::UpstreamRow;
+pub use crate::models::upstream::UpstreamRow;
 
 const COLUMNS: &str = "id, name, base_url, api_key, model_names, model_prefixes, \
     model_mappings, effort_mappings, priority, weight, auto_weight_enabled, enabled, \
@@ -210,8 +210,8 @@ pub async fn update_upstream(
                  auto_weight_enabled = ?, extra_headers = ?, updated_at = datetime('now')",
         );
         let mut values: Vec<Value> = vec![
-            Value::Text(input.input.name),
-            Value::Text(input.input.base_url),
+            Value::Text(input.input.name.clone()),
+            Value::Text(input.input.base_url.clone()),
             Value::Text(names),
             Value::Text(prefixes),
             Value::Text(mappings),

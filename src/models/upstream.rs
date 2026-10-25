@@ -208,9 +208,8 @@ pub fn validate_base_url(raw: &str) -> Result<String, String> {
         return Err("base_url must be at most 2048 bytes".to_string());
     }
 
-    let parsed = url::Url::parse(value).map_err(|error| {
-        format!("base_url is not a valid URL: unsupported URL invalid configuration")
-    })?;
+    let parsed =
+        url::Url::parse(value).map_err(|error| format!("base_url is not a valid URL: {error}"))?;
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
         return Err("base_url must start with http:// or https://".to_string());
     }
@@ -336,7 +335,7 @@ pub struct ExportUpstreamsRequest {
     pub include_api_keys: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChannelExportItem {
     pub name: String,
@@ -363,31 +362,6 @@ pub struct ChannelExportItem {
     pub archived: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled_before_archive: Option<bool>,
-}
-
-impl Default for ChannelExportItem {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            base_url: String::new(),
-            api_key: None,
-            model_names: Vec::new(),
-            model_prefixes: Vec::new(),
-            model_mappings: std::collections::BTreeMap::new(),
-            effort_mappings: None,
-            priority: 100,
-            weight: 100,
-            auto_weight_enabled: true,
-            enabled: true,
-            extra_headers: std::collections::BTreeMap::new(),
-            timeout_seconds: None,
-            rate_limit: None,
-            group_ids: Vec::new(),
-            group_names: None,
-            archived: None,
-            enabled_before_archive: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
