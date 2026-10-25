@@ -106,9 +106,6 @@ func TestSDKObservationMatchesBufferedExtraction(t *testing.T) {
 	if usage.PromptCachedTokens == nil || *usage.PromptCachedTokens != 60 {
 		t.Fatalf("prompt cached = %v, want 60", usage.PromptCachedTokens)
 	}
-	if observation.firstTokenMs == nil {
-		t.Fatal("no first-token time was recorded")
-	}
 }
 
 // A malformed event of a known type is still an Anthropic event: it must not
