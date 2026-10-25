@@ -629,7 +629,7 @@ mod tests {
             String,
             String,
             String,
-            String,
+            Option<String>,
         ) = connection
             .query_row(
                 "SELECT token, token_hash, token_preview, token_plain FROM api_tokens WHERE id = 1",
@@ -641,7 +641,8 @@ mod tests {
         assert_eq!(token, token_hash);
         assert_eq!(token_hash, token_digest("plain-secret"));
         assert!(!token_preview_value.is_empty());
-        assert_eq!(token_plain, "plain-secret");
+        // The migration deliberately does not keep the legacy plaintext.
+        assert_eq!(token_plain, None);
 
         let index: i64 = connection
             .query_row(
