@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/responses"
 )
 
 // isOpenAIStreamEventType reports whether a payload's `type` names an OpenAI
@@ -129,7 +130,7 @@ func decodeOpenAIChatEvent(data []byte) openaiEvent {
 // read from the final response.completed; the visible-token judgement is left
 // to the generic walker, whose Responses branch is separately tested.
 func decodeOpenAIResponseEvent(data []byte) openaiEvent {
-	var event openai.ResponseStreamEventUnion
+	var event responses.ResponseStreamEventUnion
 	if err := json.Unmarshal(data, &event); err != nil {
 		return openaiEvent{matched: true}
 	}
@@ -162,7 +163,7 @@ func usageFromCompletion(usage openai.CompletionUsage) openaiUsageFields {
 	return fields
 }
 
-func usageFromResponse(usage openai.ResponseUsage) openaiUsageFields {
+func usageFromResponse(usage responses.ResponseUsage) openaiUsageFields {
 	fields := openaiUsageFields{}
 	if usage.JSON.InputTokens.Valid() {
 		fields.prompt = usageInt64(usage.InputTokens)
