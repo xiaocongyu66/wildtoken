@@ -8,7 +8,8 @@ use std::process::ExitCode;
 
 use axum::routing::get;
 use axum::{Json, Router};
-use serde_json::{Value, json};
+use serde_json::json;
+use serde_json::Value;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 

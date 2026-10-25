@@ -1,0 +1,4 @@
+# The local and CI rustfmt versions sort mixed-case import lists differently.
+# Keeping statement order fixed and splitting those lists makes formatting
+# reproducible across toolchains.
+reorder_imports = false

@@ -3,7 +3,8 @@
 
 use std::collections::HashSet;
 
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::params;
+use rusqlite::{Connection, TransactionBehavior};
 
 use crate::db::token::{token_digest, token_preview, unique_marker_prefix};
 use crate::error::ApiError;

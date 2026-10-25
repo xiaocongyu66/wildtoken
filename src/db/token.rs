@@ -83,11 +83,9 @@ mod tests {
         let token = generate_api_token();
         assert_eq!(token.len(), 3 + 32);
         assert!(token.starts_with("sk-"));
-        assert!(
-            token[3..]
-                .bytes()
-                .all(|byte| API_TOKEN_RANDOM_CHARS.contains(&byte))
-        );
+        assert!(token[3..]
+            .bytes()
+            .all(|byte| API_TOKEN_RANDOM_CHARS.contains(&byte)));
     }
 
     #[test]

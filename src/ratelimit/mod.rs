@@ -2,4 +2,5 @@
 
 pub mod parser;
 
-pub use parser::{RateLimit, parse_rate_limit};
+pub use parser::parse_rate_limit;
+pub use parser::RateLimit;
