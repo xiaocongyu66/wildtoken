@@ -15,6 +15,40 @@ pub const DEFAULT_IMAGE_STORAGE_MAX_MB: i64 = 10240;
 pub const MAX_IMAGE_STORAGE_MAX_MB: i64 = 1 << 20;
 pub const MAX_DASHBOARD_MULTIPLIER: f64 = 1000.0;
 
+/// Minimum length for a bootstrap admin token.
+pub const ADMIN_TOKEN_MIN_LEN: usize = 24;
+/// Minimum length for a token chosen from the console.
+pub const ADMIN_TOKEN_ROTATE_MIN_LEN: usize = 8;
+
+/// The Argon2id snapshot plus the generation it belongs to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdminCredential {
+    pub credential_hash: String,
+    pub credential_version: i64,
+}
+
+pub fn validate_admin_token(value: &str) -> Result<String, String> {
+    validate_admin_token_value(value, ADMIN_TOKEN_MIN_LEN)
+}
+
+pub fn validate_admin_token_value(value: &str, min_len: usize) -> Result<String, String> {
+    let token = value.trim();
+    if token.len() < min_len || token.len() > 256 {
+        return Err(format!(
+            "admin token must be between {min_len} and 256 bytes"
+        ));
+    }
+    if !crate::models::token::is_ascii_graphic(token) {
+        return Err(
+            "admin token must contain only printable ASCII characters without spaces".to_string(),
+        );
+    }
+    if token.eq_ignore_ascii_case("change-me") {
+        return Err("admin token must not use the known change-me placeholder".to_string());
+    }
+    Ok(token.to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeSettings {
     pub log_body_keep_count: i64,
@@ -203,6 +237,18 @@ mod tests {
             ..RuntimeSettings::default()
         };
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn admin_tokens_are_checked_for_length_and_placeholders() {
+        assert!(validate_admin_token("change-me").is_err());
+        assert!(validate_admin_token("short").is_err());
+
+        let token = "a".repeat(ADMIN_TOKEN_MIN_LEN);
+        assert_eq!(validate_admin_token(&format!(" {token} ")).unwrap(), token);
+        assert!(validate_admin_token(&"a".repeat(257)).is_err());
+        assert!(validate_admin_token(&"a b".repeat(24)).is_err());
+        assert!(validate_admin_token_value(&"b".repeat(ADMIN_TOKEN_ROTATE_MIN_LEN), 8).is_ok());
     }
 
     #[test]
