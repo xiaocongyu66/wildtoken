@@ -508,7 +508,8 @@ func sseBytesLineHasVisibleToken(line []byte) bool {
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return false
 	}
-	if eventType, _ := payload["type"].(string); isAnthropicStreamEventType(eventType) {
+	eventType, _ := payload["type"].(string)
+	if isAnthropicStreamEventType(eventType) {
 		return decodeAnthropicStreamEvent(data, eventType).visible
 	}
 	if isOpenAIChatChunk(eventType) {
