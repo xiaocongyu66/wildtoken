@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/packages/respjson"
 	"github.com/openai/openai-go/responses"
 )
 
@@ -159,6 +160,14 @@ func usageFromCompletion(usage openai.CompletionUsage) openaiUsageFields {
 	if usage.CompletionTokensDetails.JSON.ReasoningTokens.Valid() {
 		fields.reasoning = usageInt64(usage.CompletionTokensDetails.ReasoningTokens)
 	}
+	// Vendors add cache counters the OpenAI schema does not name; the SDK
+	// keeps them in ExtraFields, so they are still read from the same parse.
+	fields.cacheWrite = firstExtraUsageInt64(usage.JSON.ExtraFields,
+		"cache_creation_input_tokens", "cache_creation_tokens", "cache_write_tokens")
+	if fields.cached == nil {
+		fields.cached = firstExtraUsageInt64(usage.JSON.ExtraFields,
+			"cache_read_input_tokens", "cache_read_tokens")
+	}
 	fields.seen = fields.prompt != nil || fields.completion != nil || fields.total != nil
 	return fields
 }
@@ -180,6 +189,31 @@ func usageFromResponse(usage responses.ResponseUsage) openaiUsageFields {
 	if usage.OutputTokensDetails.JSON.ReasoningTokens.Valid() {
 		fields.reasoning = usageInt64(usage.OutputTokensDetails.ReasoningTokens)
 	}
+	fields.cacheWrite = firstExtraUsageInt64(usage.JSON.ExtraFields,
+		"cache_creation_input_tokens", "cache_creation_tokens", "cache_write_tokens")
+	if fields.cached == nil {
+		fields.cached = firstExtraUsageInt64(usage.JSON.ExtraFields,
+			"cache_read_input_tokens", "cache_read_tokens")
+	}
 	fields.seen = fields.prompt != nil || fields.completion != nil || fields.total != nil
 	return fields
+}
+
+// firstExtraUsageInt64 reads the first named counter the SDK kept as an
+// unknown usage field.
+func firstExtraUsageInt64(fields map[string]respjson.Field, names ...string) *int32 {
+	for _, name := range names {
+		field, present := fields[name]
+		if !present || !field.Valid() {
+			continue
+		}
+		var value int64
+		if err := json.Unmarshal([]byte(field.Raw()), &value); err != nil {
+			continue
+		}
+		if converted := usageInt64(value); converted != nil {
+			return converted
+		}
+	}
+	return nil
 }

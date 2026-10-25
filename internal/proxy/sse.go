@@ -622,27 +622,24 @@ func (o *sseObservation) observeLine(line []byte, elapsedMs func() int32) {
 		return
 	}
 	eventType, _ := payload["type"].(string)
-	if isAnthropicStreamEventType(eventType) {
+	switch {
+	case isAnthropicStreamEventType(eventType):
 		event := decodeAnthropicStreamEvent([]byte(data), eventType)
 		o.anthropicUsage.merge(event.usage)
 		if event.finalUsage {
 			o.finalUsageSeen = true
 		}
-		o.outputEstimate += estimateDeltaTokens(payload)
-		return
-	}
-	if isOpenAIStreamEventType(eventType) {
+	case isOpenAIStreamEventType(eventType):
 		event := decodeOpenAIStreamEvent([]byte(data), eventType)
 		o.openaiUsage.merge(event.usage)
 		if event.finalUsage {
 			o.finalUsageSeen = true
 		}
-		o.outputEstimate += estimateDeltaTokens(payload)
-		return
-	}
-	o.usage.add(payload)
-	if usageObject(payload) != nil && payload["type"] != "message_start" {
-		o.finalUsageSeen = true
+	default:
+		o.usage.add(payload)
+		if usageObject(payload) != nil && payload["type"] != "message_start" {
+			o.finalUsageSeen = true
+		}
 	}
 	o.outputEstimate += estimateDeltaTokens(payload)
 	if o.streamError == nil {
