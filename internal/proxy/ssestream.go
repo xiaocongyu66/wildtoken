@@ -2,10 +2,11 @@ package proxy
 
 import (
 	"context"
-	"encoding/json"
 	"io"
 	"sync"
 	"time"
+
+	"github.com/liguangsheng/wildtoken/internal/logbody"
 )
 
 // sseStream forwards an upstream SSE body downstream while observing it, and
@@ -234,7 +235,7 @@ func (s *sseStream) finishInterrupted(err error) {
 // whole so its images can be saved as files; the log body cap then applies to
 // what is left. A capture that ran past its bound is logged as before, since a
 // cut-off event cannot be decoded.
-func (s *sseStream) snapshotResponse() json.RawMessage {
+func (s *sseStream) snapshotResponse() *logbody.Snapshot {
 	body, byteLength := s.capture.bytes, s.capture.byteLength
 	if byteLength == len(body) {
 		body = s.deps.Images.Rewrite(body)

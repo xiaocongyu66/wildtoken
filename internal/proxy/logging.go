@@ -3,7 +3,6 @@ package proxy
 import (
 	"context"
 	"database/sql"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -11,10 +10,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
 	"github.com/liguangsheng/wildtoken/internal/apperr"
 	"github.com/liguangsheng/wildtoken/internal/db"
+	"github.com/liguangsheng/wildtoken/internal/logbody"
 	"github.com/liguangsheng/wildtoken/internal/models"
 	"github.com/liguangsheng/wildtoken/internal/quota"
 )
@@ -32,6 +31,17 @@ const (
 	logBodyCleanupInterval      = 60 * time.Second
 	logRetentionCleanupInterval = 3600 * time.Second
 	incrementalVacuumMaxPages   = 4096
+
+	// logWriteBatchBytes caps the captured body bytes one batch carries, so a
+	// few large bodies do not hold the write lock for long.
+	logWriteBatchBytes = 64 << 20
+	// logQueueBodyBudget caps the captured body bytes waiting in the queue. A
+	// queued snapshot keeps its request's buffer alive and the queue holds
+	// hundreds of entries, so past the budget a body keeps only its length.
+	logQueueBodyBudget = 256 << 20
+	// chunkCollectionInterval spaces out chunk collection, which reads every
+	// stored body record.
+	chunkCollectionInterval = 10 * time.Minute
 )
 
 // LogEntry is a structured record of one proxied request.
@@ -63,10 +73,63 @@ type LogEntry struct {
 	FirstTokenMs              *int32
 	DurationMs                *int32
 	Error                     *string
-	DownstreamRequest         json.RawMessage
-	UpstreamRequest           json.RawMessage
-	UpstreamResponse          json.RawMessage
-	DownstreamResponse        json.RawMessage
+	// The captured snapshots. One snapshot may fill several slots, and several
+	// entries: a retried request logs the same request on every attempt.
+	DownstreamRequest  *logbody.Snapshot
+	UpstreamRequest    *logbody.Snapshot
+	UpstreamResponse   *logbody.Snapshot
+	DownstreamResponse *logbody.Snapshot
+}
+
+// snapshots lists the entry's snapshots in body record order.
+func (e *LogEntry) snapshots() [logbody.SlotCount]*logbody.Snapshot {
+	return [logbody.SlotCount]*logbody.Snapshot{
+		e.DownstreamRequest, e.UpstreamRequest, e.UpstreamResponse, e.DownstreamResponse,
+	}
+}
+
+// bodyBytes is how many captured body bytes the entry keeps in memory. A
+// buffer two snapshots share — a request nothing rewrote — counts once.
+func (e *LogEntry) bodyBytes() int {
+	total := 0
+	var seen [logbody.SlotCount]*byte
+	for i, snapshot := range e.snapshots() {
+		if snapshot.BodyBytes() == 0 {
+			continue
+		}
+		first := &snapshot.Body.Data[0]
+		shared := false
+		for _, other := range seen[:i] {
+			shared = shared || other == first
+		}
+		seen[i] = first
+		if !shared {
+			total += snapshot.BodyBytes()
+		}
+	}
+	return total
+}
+
+// withoutBodies returns a copy of the entry whose bodies keep only their
+// lengths. Slots that shared a snapshot still share its replacement; the
+// originals are left alone, since other entries may hold them.
+func (e LogEntry) withoutBodies() LogEntry {
+	replaced := map[*logbody.Snapshot]*logbody.Snapshot{}
+	strip := func(snapshot *logbody.Snapshot) *logbody.Snapshot {
+		if snapshot == nil {
+			return nil
+		}
+		if replacement, ok := replaced[snapshot]; ok {
+			return replacement
+		}
+		replaced[snapshot] = snapshot.WithoutBody()
+		return replaced[snapshot]
+	}
+	e.DownstreamRequest = strip(e.DownstreamRequest)
+	e.UpstreamRequest = strip(e.UpstreamRequest)
+	e.UpstreamResponse = strip(e.UpstreamResponse)
+	e.DownstreamResponse = strip(e.DownstreamResponse)
+	return e
 }
 
 // LogStreamEvent reports that a committed request-log row became available to
@@ -114,6 +177,10 @@ type LogWriter struct {
 	closeMu   sync.RWMutex
 	closed    bool
 	closeOnce sync.Once
+
+	// queuedBodyBytes counts the captured body bytes entries in the queue hold,
+	// against logQueueBodyBudget.
+	queuedBodyBytes atomic.Int64
 
 	// carried is usage whose row was dropped or failed to commit, per token.
 	// It is still owed to the stored total, so a later batch applies it on its
@@ -166,9 +233,20 @@ func (w *LogWriter) Schedule(entry LogEntry) {
 		w.quotas.Meter(tokenID, used)
 	}
 
+	// A burst of large requests must not pile their buffers up in memory while
+	// they wait for the writer. Past the budget the body keeps only its length;
+	// the row and the usage it carries are still written.
+	size := int64(entry.bodyBytes())
+	if size > 0 && w.queuedBodyBytes.Add(size) > logQueueBodyBudget {
+		w.queuedBodyBytes.Add(-size)
+		entry, size = entry.withoutBodies(), 0
+		slog.Warn("request log queue holds too many body bytes; logging only the body lengths")
+	}
+
 	select {
 	case w.entries <- entry:
 	default:
+		w.queuedBodyBytes.Add(-size)
 		w.metrics.RecordLogDequeue(1)
 		w.metrics.RecordLogDrop()
 		slog.Warn("request log queue full; dropping request log")
@@ -285,13 +363,14 @@ func (w *LogWriter) run(ctx context.Context, database *sql.DB, logStats *db.LogS
 			return
 		}
 		batch = append(batch, entry)
+		batchBytes := entry.bodyBytes()
 
 		// Collect further entries until the batch fills or the window closes, so
 		// bursts commit in one transaction.
 		flushDeadline := time.NewTimer(logWriteBatchInterval)
 		channelClosed := false
 	collect:
-		for len(batch) < logWriteBatchSize {
+		for len(batch) < logWriteBatchSize && batchBytes < logWriteBatchBytes {
 			select {
 			case <-flushDeadline.C:
 				break collect
@@ -301,6 +380,7 @@ func (w *LogWriter) run(ctx context.Context, database *sql.DB, logStats *db.LogS
 					break collect
 				}
 				batch = append(batch, next)
+				batchBytes += next.bodyBytes()
 			}
 		}
 		flushDeadline.Stop()
@@ -319,6 +399,10 @@ func (w *LogWriter) flush(ctx context.Context, database *sql.DB, logStats *db.Lo
 	entries []LogEntry) {
 	entryCount := uint64(len(entries))
 	w.metrics.RecordLogDequeue(entryCount)
+	// Out of the queue, these bodies no longer count against its budget.
+	for i := range entries {
+		w.queuedBodyBytes.Add(-int64(entries[i].bodyBytes()))
+	}
 
 	carried := w.takeCarried()
 	if len(entries) == 0 && len(carried) == 0 {
@@ -333,7 +417,8 @@ func (w *LogWriter) flush(ctx context.Context, database *sql.DB, logStats *db.Lo
 	defer cancel()
 
 	startedAt := time.Now()
-	records, err := insertLogBatchWithRetry(writeCtx, database, entries, carried)
+	prepared := prepareLogBatch(writeCtx, database, entries)
+	records, err := insertLogBatchWithRetry(writeCtx, database, entries, prepared, carried)
 	if err != nil {
 		w.metrics.RecordLogWriteFailureCount(entryCount)
 		slog.Error("failed to persist request logs", "error", err, "entry_count", entryCount)
@@ -402,14 +487,31 @@ func (w *LogWriter) publish(ctx context.Context, database *sql.DB, logStats *db.
 	}
 }
 
+// prepareLogBatch cuts and hashes a batch's bodies and compresses the chunks
+// not stored yet. It runs before the write transaction, so only inserts happen
+// while the write lock is held; retries reuse its work.
+func prepareLogBatch(ctx context.Context, database *sql.DB, entries []LogEntry) []*logbody.Prepared {
+	chunks := logbody.NewBatch()
+	prepared := make([]*logbody.Prepared, len(entries))
+	for i := range entries {
+		prepared[i] = chunks.Prepare(entries[i].snapshots())
+	}
+	// The lookup is only a hint; the transaction compresses whatever it finds
+	// missing, so a failure here costs time, not rows.
+	if err := db.PackNewChunks(ctx, database, chunks.Chunks()); err != nil {
+		slog.Warn("looking up stored log chunks failed", "error", err)
+	}
+	return prepared
+}
+
 func insertLogBatchWithRetry(ctx context.Context, database *sql.DB, entries []LogEntry,
-	carried map[int64]int64) ([]persistedLogRecord, error) {
+	prepared []*logbody.Prepared, carried map[int64]int64) ([]persistedLogRecord, error) {
 	if len(entries) == 0 && len(carried) == 0 {
 		return nil, nil
 	}
 
 	for attempt := 0; ; attempt++ {
-		records, err := insertLogBatch(ctx, database, entries, carried)
+		records, err := insertLogBatch(ctx, database, entries, prepared, carried)
 		if err == nil {
 			return records, nil
 		}
@@ -438,13 +540,18 @@ func isDatabaseLocked(err error) bool {
 		strings.Contains(err.Error(), "SQLITE_BUSY")
 }
 
+// insertLogBatch writes a batch's rows, their snapshots and the quota usage
+// they carry in one transaction. prepared holds each entry's snapshots, cut by
+// prepareLogBatch.
 func insertLogBatch(ctx context.Context, database *sql.DB, entries []LogEntry,
-	carried map[int64]int64) ([]persistedLogRecord, error) {
+	prepared []*logbody.Prepared, carried map[int64]int64) ([]persistedLogRecord, error) {
 	tx, err := database.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, apperr.Database(err)
 	}
 	defer tx.Rollback()
+	payloads := db.NewPayloadStore(tx)
+	defer payloads.Close()
 
 	// Usage owed by rows that were dropped or failed earlier.
 	for tokenID, used := range carried {
@@ -456,7 +563,7 @@ func insertLogBatch(ctx context.Context, database *sql.DB, entries []LogEntry,
 	}
 
 	records := make([]persistedLogRecord, 0, len(entries))
-	for _, entry := range entries {
+	for i, entry := range entries {
 		now := time.Now().UTC()
 		createdAt := now.Format(models.TimestampFormat)
 		streamInt := int32(0)
@@ -467,8 +574,6 @@ func insertLogBatch(ctx context.Context, database *sql.DB, entries []LogEntry,
 		if entry.ClientType != nil {
 			clientType = *entry.ClientType
 		}
-		requestPayload := encodeSnapshotPair(entry.DownstreamRequest, entry.UpstreamRequest)
-		responsePayload := encodeSnapshotPair(entry.UpstreamResponse, entry.DownstreamResponse)
 
 		// The token and channel ids were resolved when the request began, and
 		// either row may have been deleted since. A dangling id failed the
@@ -505,17 +610,8 @@ func insertLogBatch(ctx context.Context, database *sql.DB, entries []LogEntry,
 			return nil, apperr.Database(err)
 		}
 
-		_, err = tx.ExecContext(ctx, `INSERT INTO request_log_payloads
-        (request_log_id, request_snapshot,
-         upstream_request_override, upstream_request_is_override,
-         response_snapshot,
-         downstream_response_override, downstream_response_is_override)
-    VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			logID, requestPayload.canonical, requestPayload.overrideValue,
-			boolToInt64(requestPayload.isOverride), responsePayload.canonical,
-			responsePayload.overrideValue, boolToInt64(responsePayload.isOverride))
-		if err != nil {
-			return nil, apperr.Database(err)
+		if err := payloads.Store(ctx, logID, prepared[i], false); err != nil {
+			return nil, err
 		}
 
 		// The quota counter advances with the log row, so a committed request is
@@ -580,49 +676,6 @@ func insertLogBatch(ctx context.Context, database *sql.DB, entries []LogEntry,
 		return nil, apperr.Database(err)
 	}
 	return records, nil
-}
-
-// encodedSnapshotPair is one canonical snapshot plus the peer, retained only
-// when it differs.
-type encodedSnapshotPair struct {
-	canonical     any
-	overrideValue any
-	isOverride    bool
-}
-
-// encodeSnapshotPair stores one canonical snapshot and only retains the peer
-// when it differs.
-//
-// The explicit flag is intentionally independent of overrideValue: a null
-// override with the flag set means the peer snapshot was absent, while a clear
-// flag means it was identical to the canonical snapshot.
-func encodeSnapshotPair(canonical, peer json.RawMessage) encodedSnapshotPair {
-	isOverride := !snapshotsEqual(canonical, peer)
-
-	pair := encodedSnapshotPair{isOverride: isOverride}
-	if canonical != nil {
-		pair.canonical = string(canonical)
-	}
-	if isOverride && peer != nil {
-		pair.overrideValue = string(peer)
-	}
-	return pair
-}
-
-// snapshotsEqual compares two snapshots by their serialized form, which is how
-// they are stored and compared downstream.
-func snapshotsEqual(left, right json.RawMessage) bool {
-	if left == nil || right == nil {
-		return left == nil && right == nil
-	}
-	return string(left) == string(right)
-}
-
-func boolToInt64(value bool) int64 {
-	if value {
-		return 1
-	}
-	return 0
 }
 
 func int32PtrToInt64Ptr(value *int32) *int64 {
@@ -702,25 +755,25 @@ func (b *eventBroker) publish(event LogStreamEvent) {
 
 // ── Snapshots ────────────────────────────────────────────────────────────────
 
-// SnapshotRequest builds a request snapshot with redacted headers and a
-// truncated body.
+// SnapshotRequest captures a request: its method, url and redacted headers as
+// metadata, and up to bodyMaxBytes of its body.
 func SnapshotRequest(method, url string, headers map[string]string, body []byte,
-	bodyMaxBytes int) json.RawMessage {
-	snapshot := map[string]any{
+	bodyMaxBytes int) *logbody.Snapshot {
+	snapshot := &logbody.Snapshot{Meta: mustMarshalSnapshot(map[string]any{
 		"method":  method,
 		"url":     url,
 		"headers": redactHeaders(headers),
-	}
+	})}
 	if body != nil {
-		snapshot["body"] = truncateBody(body, bodyMaxBytes)
+		snapshot.Body = logbody.CaptureBody(body, bodyMaxBytes, len(body))
 	}
-	return mustMarshalSnapshot(snapshot)
+	return snapshot
 }
 
-// SnapshotResponse builds a response snapshot with redacted headers and a
-// truncated body.
+// SnapshotResponse captures a response: its status and redacted headers as
+// metadata, and up to bodyMaxBytes of its body.
 func SnapshotResponse(status int, headers map[string]string, body []byte,
-	bodyMaxBytes int) json.RawMessage {
+	bodyMaxBytes int) *logbody.Snapshot {
 	length := -1
 	if body != nil {
 		length = len(body)
@@ -728,29 +781,29 @@ func SnapshotResponse(status int, headers map[string]string, body []byte,
 	return SnapshotResponseWithBodyLength(status, headers, body, length, bodyMaxBytes)
 }
 
-// SnapshotResponseWithBodyLength builds a response snapshot from a bounded body
+// SnapshotResponseWithBodyLength captures a response from a bounded body
 // prefix while retaining the original response length. A negative
 // bodyByteLength means the prefix is the whole body.
 func SnapshotResponseWithBodyLength(status int, headers map[string]string, body []byte,
-	bodyByteLength, bodyMaxBytes int) json.RawMessage {
-	snapshot := map[string]any{
+	bodyByteLength, bodyMaxBytes int) *logbody.Snapshot {
+	snapshot := &logbody.Snapshot{Meta: mustMarshalSnapshot(map[string]any{
 		"status_code": status,
 		"status":      status,
 		"headers":     redactHeaders(headers),
-	}
+	})}
 	if body != nil {
 		length := bodyByteLength
 		if length < 0 {
 			length = len(body)
 		}
-		snapshot["body"] = truncateBodyWithLength(body, bodyMaxBytes, length)
+		snapshot.Body = logbody.CaptureBody(body, bodyMaxBytes, length)
 	}
-	return mustMarshalSnapshot(snapshot)
+	return snapshot
 }
 
-// mustMarshalSnapshot serializes a snapshot built from types that always
-// marshal. A failure here would mean a programming error, so it degrades to an
-// empty object rather than failing the request being logged.
+// mustMarshalSnapshot serializes snapshot metadata built from types that
+// always marshal. A failure here would mean a programming error, so it degrades
+// to an empty object rather than failing the request being logged.
 func mustMarshalSnapshot(snapshot map[string]any) json.RawMessage {
 	encoded, err := json.Marshal(snapshot)
 	if err != nil {
@@ -772,79 +825,11 @@ func redactHeaders(headers map[string]string) map[string]string {
 	return redacted
 }
 
-func truncateBody(body []byte, budget int) map[string]any {
-	return truncateBodyWithLength(body, budget, len(body))
-}
-
-// truncateBodyWithLength renders a body into a frontend-friendly object:
-//   - text UTF-8: {text, byte_length}
-//   - binary or oversized: {base64, encoding, byte_length, truncated}
-func truncateBodyWithLength(body []byte, budget, originalByteLength int) map[string]any {
-	if budget == 0 {
-		return map[string]any{"cleared": true, "byte_length": originalByteLength}
-	}
-	if len(body) == 0 {
-		return map[string]any{"text": "", "byte_length": originalByteLength}
-	}
-
-	// Text is cut on a UTF-8 boundary. Binary bytes are sliced before encoding.
-	slice := body[:min(len(body), budget)]
-	if text, ok := validTextPrefix(body, slice, originalByteLength); ok {
-		snapshot := map[string]any{"text": text, "byte_length": originalByteLength}
-		if len(text) < originalByteLength {
-			snapshot["truncated"] = true
-		}
-		return snapshot
-	}
-
-	snapshot := map[string]any{
-		"base64":      base64.StdEncoding.EncodeToString(slice),
-		"encoding":    "base64",
-		"byte_length": originalByteLength,
-	}
-	if len(slice) < originalByteLength {
-		snapshot["truncated"] = true
-	}
-	return snapshot
-}
-
-// validTextPrefix returns the longest valid UTF-8 prefix of slice, or ok=false
-// when the body is not text at all.
-func validTextPrefix(body, slice []byte, originalByteLength int) (string, bool) {
-	if len(body) == originalByteLength {
-		// The whole body is present, so it can be validated as one string before
-		// the prefix is cut back to a rune boundary. An index equal to the length
-		// is already a boundary, which is why the guard stops there.
-		if !utf8.Valid(body) {
-			return "", false
-		}
-		cutoff := len(slice)
-		for cutoff > 0 && cutoff < len(body) && !utf8.RuneStart(body[cutoff]) {
-			cutoff--
-		}
-		return string(body[:cutoff]), true
-	}
-
-	// Only a prefix of a longer body is available. A trailing partial rune is
-	// expected here, so up to UTFMax-1 bytes of it are dropped; anything invalid
-	// before that is binary, as it is for a whole body. Backing off one byte at
-	// a time instead revalidated the prefix at every step: a stray byte midway
-	// through a 1 MiB capture cost 13 seconds.
-	for back := 0; back < utf8.UTFMax && back <= len(slice); back++ {
-		if prefix := slice[:len(slice)-back]; utf8.Valid(prefix) {
-			if len(prefix) == 0 && len(slice) > 0 {
-				return "", false
-			}
-			return string(prefix), true
-		}
-	}
-	return "", false
-}
-
 // ── Background cleanup ──────────────────────────────────────────────────────
 
-// RunCleanupLoop keeps full bodies near the configured row limit and performs
-// the heavier retention and statistics work hourly.
+// RunCleanupLoop keeps full bodies near the configured row limit, collects the
+// chunks dropped bodies leave behind every ten minutes, and performs the
+// heavier retention and statistics work hourly.
 //
 // The runtime policy is read through a getter rather than a shared lock, so the
 // loop always sees the latest console edit without owning the settings.
@@ -859,6 +844,7 @@ func RunCleanupLoop(ctx context.Context, database *sql.DB, settings func() model
 	ticker := time.NewTicker(logBodyCleanupInterval)
 	defer ticker.Stop()
 	nextRetentionCleanup := time.Now()
+	nextChunkCollection := time.Now()
 
 	for {
 		select {
@@ -868,19 +854,34 @@ func RunCleanupLoop(ctx context.Context, database *sql.DB, settings func() model
 		}
 
 		now := time.Now()
-		runRetentionCleanup := !now.Before(nextRetentionCleanup)
-		if runRetentionCleanup {
+		var steps CleanupSteps
+		if !now.Before(nextRetentionCleanup) {
+			steps.Retention = true
 			nextRetentionCleanup = now.Add(logRetentionCleanupInterval)
+		}
+		if !now.Before(nextChunkCollection) {
+			steps.Chunks = true
+			nextChunkCollection = now.Add(chunkCollectionInterval)
 		}
 
 		current := settings()
-		RunCleanupPass(ctx, database, &current, metrics, logStats, runRetentionCleanup)
+		RunCleanupPass(ctx, database, &current, metrics, logStats, steps)
 	}
+}
+
+// CleanupSteps says which of the heavier steps a cleanup pass takes, besides
+// clearing the bodies past the keep count, which every pass does.
+type CleanupSteps struct {
+	// Retention deletes logs past the retention window, with the snapshot
+	// metadata only they referred to.
+	Retention bool
+	// Chunks deletes the body chunks no stored log lists any more.
+	Chunks bool
 }
 
 // RunCleanupPass performs one cleanup cycle.
 func RunCleanupPass(ctx context.Context, database *sql.DB, settings *models.RuntimeSettings,
-	metrics LogMetricsRecorder, logStats *db.LogStatsCache, runRetentionCleanup bool) {
+	metrics LogMetricsRecorder, logStats *db.LogStatsCache, steps CleanupSteps) {
 	cleanupStartedAt := time.Now()
 	cleanupSucceeded := true
 	metrics.BeginCleanup()
@@ -898,7 +899,7 @@ func RunCleanupPass(ctx context.Context, database *sql.DB, settings *models.Runt
 		slog.Error("clearing old log bodies failed", "error", err)
 	}
 
-	if runRetentionCleanup {
+	if steps.Retention {
 		deleteStartedAt := time.Now()
 		if err := db.DeleteOldLogs(ctx, database, settings.LogRetentionDays); err != nil {
 			if errors.Is(err, context.Canceled) {
@@ -907,6 +908,16 @@ func RunCleanupPass(ctx context.Context, database *sql.DB, settings *models.Runt
 			}
 			cleanupSucceeded = false
 			slog.Error("deleting old logs failed", "error", err)
+		}
+		// Snapshot metadata is shared between logs, so it goes only once the
+		// last log referring to it has.
+		if _, err := db.CollectLogMetas(ctx, database); err != nil {
+			if errors.Is(err, context.Canceled) {
+				slog.Info("log metadata collection stopped for shutdown")
+				return
+			}
+			cleanupSucceeded = false
+			slog.Error("collecting log metadata failed", "error", err)
 		}
 		if time.Since(deleteStartedAt) >= slowDBOperationThreshold {
 			metrics.RecordSlowDBOperation()
@@ -918,6 +929,25 @@ func RunCleanupPass(ctx context.Context, database *sql.DB, settings *models.Runt
 			slog.Warn("request log statistics refresh after cleanup failed", "error", err)
 		}
 		if time.Since(statsRefreshStartedAt) >= slowDBOperationThreshold {
+			metrics.RecordSlowDBOperation()
+		}
+	}
+
+	// After clearing and retention, so it sees every body those just dropped.
+	if steps.Chunks {
+		collectStartedAt := time.Now()
+		collected, err := db.CollectLogChunks(ctx, database)
+		switch {
+		case errors.Is(err, context.Canceled):
+			slog.Info("log chunk collection stopped for shutdown")
+			return
+		case err != nil:
+			cleanupSucceeded = false
+			slog.Error("collecting log body chunks failed", "error", err)
+		case collected > 0:
+			slog.Debug("collected log body chunks no log lists", "chunks", collected)
+		}
+		if time.Since(collectStartedAt) >= slowDBOperationThreshold {
 			metrics.RecordSlowDBOperation()
 		}
 	}

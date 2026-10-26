@@ -358,10 +358,15 @@ The admin console includes:
   reasoning-token fields when providers report them
 - server-side log body retention, full-log retention, and snapshot byte limits
 
-Log metadata and body snapshots are stored separately. WildToken can prune old
-snapshot bodies while keeping status code, channel, model, token usage, latency,
-and headers. SQLite incremental vacuum keeps reclaimed pages from accumulating
-indefinitely.
+Log metadata and body snapshots are stored separately. Bodies are cut into
+content-defined chunks and each chunk is stored once: a coding agent resends its
+whole conversation every turn, so consecutive requests are nearly identical and
+each log only pays for its new turn. Snapshot metadata such as headers is
+stored once per distinct value too. Logs past the keep count lose their bodies
+but keep status code, channel, model, token usage, latency, and headers; chunks
+no body lists any more are then collected. Up to 100,000 logs can keep their
+bodies, at up to 128 MiB per body. SQLite incremental vacuum returns the freed
+pages to the filesystem.
 
 ## 🎨 Themes
 

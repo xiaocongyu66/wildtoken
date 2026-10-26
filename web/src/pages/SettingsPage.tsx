@@ -373,8 +373,8 @@ export function SettingsPage({ onUnauthorized }: { onUnauthorized: (message: str
                       label="正文保留数量"
                       value={settings.log_body_keep_count}
                       min={1}
-                      max={10000}
-                      hint="每条日志保留的正文快照数量。"
+                      max={100000}
+                      hint="保留完整正文的最近日志条数，更早的只留元数据和请求头。"
                       onChange={(v) => patch("log_body_keep_count", v)}
                     />
                     <NumberField
@@ -390,8 +390,8 @@ export function SettingsPage({ onUnauthorized }: { onUnauthorized: (message: str
                       label="原始正文采集上限（字节）"
                       value={settings.log_body_max_bytes}
                       min={0}
-                      max={1048576}
-                      hint="设为 0 时只保留元数据和请求头，不采集正文。"
+                      max={134217728}
+                      hint="最大 128 MiB。设为 0 时只保留元数据和请求头，不采集正文。"
                       onChange={(v) => patch("log_body_max_bytes", v)}
                     />
                     {/* 服务端按 MB 存，这里按 GB 填：图片目录的量级是 GB。显示取两位

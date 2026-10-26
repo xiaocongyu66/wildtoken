@@ -10,18 +10,19 @@ import (
 	"time"
 
 	"github.com/liguangsheng/wildtoken/internal/apperr"
+	"github.com/liguangsheng/wildtoken/internal/logbody"
 	"github.com/liguangsheng/wildtoken/internal/models"
 )
 
 const (
-	// logBodyCleanupBatchSize is how many payload rows one pass clears.
+	// logBodyCleanupBatchSize is how many rows one batch clears.
 	//
-	// Each row's JSON is parsed and rewritten outside the transaction, so the
-	// batch bounds the work between yields rather than the lock hold itself. At
-	// eight rows per 25ms the pass cleared about 320 a second, which a gateway
-	// serving more than that outruns — the stored bodies then grow without the
-	// keep-count policy ever catching up.
-	logBodyCleanupBatchSize  int64 = 64
+	// Clearing deletes a range of body records and flips a flag; no JSON is
+	// parsed. A batch has to outpace a gateway that keeps writing: at eight rows
+	// per 25ms an earlier version cleared about 320 a second, and a busier
+	// gateway then grew the stored bodies without the keep-count policy ever
+	// catching up.
+	logBodyCleanupBatchSize  int64 = 1000
 	logBodyCleanupBatchPause       = 25 * time.Millisecond
 	// logDeleteBatchSize is how many expired log rows one delete removes.
 	//
@@ -350,17 +351,8 @@ func GetLogDetail(ctx context.Context, database *sql.DB, logID int64) (models.Re
               l.prompt_tokens, l.completion_tokens, l.total_tokens,
               l.prompt_cached_tokens, l.cache_creation_tokens, l.completion_reasoning_tokens,
               l.duration_ms, l.first_token_ms,
-              l.error,
-              p.request_snapshot,
-              p.upstream_request_override,
-              COALESCE(p.upstream_request_is_override, 0)
-                  AS upstream_request_is_override,
-              p.response_snapshot,
-              p.downstream_response_override,
-              COALESCE(p.downstream_response_is_override, 0)
-                  AS downstream_response_is_override
+              l.error
        FROM request_logs AS l
-       LEFT JOIN request_log_payloads AS p ON p.request_log_id = l.id
        WHERE l.id = ?`, logID)
 
 	var detail models.RequestLogDetailOut
@@ -370,9 +362,6 @@ func GetLogDetail(ctx context.Context, database *sql.DB, logID int64) (models.Re
 	var statusCode, promptTokens, completionTokens, totalTokens sql.NullInt64
 	var promptCachedTokens, cacheCreationTokens, completionReasoningTokens sql.NullInt64
 	var durationMs, firstTokenMs sql.NullInt64
-	var requestSnapshot, upstreamRequestOverride sql.NullString
-	var responseSnapshot, downstreamResponseOverride sql.NullString
-	var upstreamRequestIsOverride, downstreamResponseIsOverride int32
 	var clientIP sql.NullString
 
 	err := row.Scan(&detail.ID, &detail.CreatedAt, &detail.Method, &detail.Path,
@@ -382,9 +371,7 @@ func GetLogDetail(ctx context.Context, database *sql.DB, logID int64) (models.Re
 		&detail.Stream, &statusCode,
 		&promptTokens, &completionTokens, &totalTokens,
 		&promptCachedTokens, &cacheCreationTokens, &completionReasoningTokens,
-		&durationMs, &firstTokenMs, &logError,
-		&requestSnapshot, &upstreamRequestOverride, &upstreamRequestIsOverride,
-		&responseSnapshot, &downstreamResponseOverride, &downstreamResponseIsOverride)
+		&durationMs, &firstTokenMs, &logError)
 	if errors.Is(err, sql.ErrNoRows) {
 		return detail, false, nil
 	}
@@ -414,21 +401,17 @@ func GetLogDetail(ctx context.Context, database *sql.DB, logID int64) (models.Re
 	detail.DurationMs = nullInt32Ptr(durationMs)
 	detail.FirstTokenMs = nullInt32Ptr(firstTokenMs)
 
-	// A cleared override flag means the peer snapshot was identical to the
-	// canonical one, so the canonical value is what the console should show.
-	upstreamRequest := requestSnapshot
-	if upstreamRequestIsOverride != 0 {
-		upstreamRequest = upstreamRequestOverride
+	snapshots, found, err := loadLogSnapshots(ctx, database, logID,
+		logbody.SlotDownstreamRequest, logbody.SlotUpstreamRequest,
+		logbody.SlotUpstreamResponse, logbody.SlotDownstreamResponse)
+	if err != nil || !found {
+		// Not found here means the log was deleted between the two reads.
+		return detail, false, err
 	}
-	downstreamResponse := responseSnapshot
-	if downstreamResponseIsOverride != 0 {
-		downstreamResponse = downstreamResponseOverride
-	}
-
-	detail.DownstreamRequest = decodeSnapshot(requestSnapshot)
-	detail.UpstreamRequest = decodeSnapshot(upstreamRequest)
-	detail.UpstreamResponse = decodeSnapshot(responseSnapshot)
-	detail.DownstreamResponse = decodeSnapshot(downstreamResponse)
+	detail.DownstreamRequest = snapshots[logbody.SlotDownstreamRequest]
+	detail.UpstreamRequest = snapshots[logbody.SlotUpstreamRequest]
+	detail.UpstreamResponse = snapshots[logbody.SlotUpstreamResponse]
+	detail.DownstreamResponse = snapshots[logbody.SlotDownstreamResponse]
 	return detail, true, nil
 }
 
@@ -452,66 +435,30 @@ func ParseLogSnapshotField(name string) (LogSnapshotField, bool) {
 	return "", false
 }
 
+// snapshotSlots places each field in a stored body record.
+var snapshotSlots = map[LogSnapshotField]int{
+	LogSnapshotDownstreamRequest:  logbody.SlotDownstreamRequest,
+	LogSnapshotUpstreamRequest:    logbody.SlotUpstreamRequest,
+	LogSnapshotUpstreamResponse:   logbody.SlotUpstreamResponse,
+	LogSnapshotDownstreamResponse: logbody.SlotDownstreamResponse,
+}
+
 // GetLogSnapshot returns one captured payload, or ok=false when the log is
 // missing. A log without that payload is found with a nil snapshot.
 //
 // The console opens a log with its metadata already in hand and fetches each
-// payload as the reader asks for it, so this reads only the columns that
-// payload needs instead of the whole payload row.
+// payload as the reader asks for it, so this reads only the chunks that
+// payload needs instead of all four bodies.
 func GetLogSnapshot(ctx context.Context, database *sql.DB, logID int64, field LogSnapshotField) (json.RawMessage, bool, error) {
-	// The override columns pair with their canonical snapshot the same way
-	// GetLogDetail resolves them; the canonical fields carry no override.
-	var canonical, override, isOverride string
-	switch field {
-	case LogSnapshotDownstreamRequest:
-		canonical = "p.request_snapshot"
-	case LogSnapshotUpstreamRequest:
-		canonical, override, isOverride = "p.request_snapshot",
-			"p.upstream_request_override", "p.upstream_request_is_override"
-	case LogSnapshotUpstreamResponse:
-		canonical = "p.response_snapshot"
-	case LogSnapshotDownstreamResponse:
-		canonical, override, isOverride = "p.response_snapshot",
-			"p.downstream_response_override", "p.downstream_response_is_override"
-	default:
+	slot, ok := snapshotSlots[field]
+	if !ok {
 		return nil, false, apperr.BadRequest("unknown snapshot field")
 	}
-	if override == "" {
-		override, isOverride = "NULL", "0"
+	snapshots, found, err := loadLogSnapshots(ctx, database, logID, slot)
+	if err != nil || !found {
+		return nil, found, err
 	}
-
-	row := database.QueryRowContext(ctx, `SELECT `+canonical+`, `+override+`,
-              COALESCE(`+isOverride+`, 0)
-       FROM request_logs AS l
-       LEFT JOIN request_log_payloads AS p ON p.request_log_id = l.id
-       WHERE l.id = ?`, logID)
-
-	var stored, storedOverride sql.NullString
-	var overridden int32
-	err := row.Scan(&stored, &storedOverride, &overridden)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, false, nil
-	}
-	if err != nil {
-		return nil, false, apperr.Database(err)
-	}
-	if overridden != 0 {
-		stored = storedOverride
-	}
-	return decodeSnapshot(stored), true, nil
-}
-
-// decodeSnapshot returns the stored JSON, or nil when it is absent or corrupt.
-// A stored snapshot that no longer parses is treated as missing rather than
-// failing the whole request.
-func decodeSnapshot(stored sql.NullString) json.RawMessage {
-	if !stored.Valid || stored.String == "" {
-		return nil
-	}
-	if !json.Valid([]byte(stored.String)) {
-		return nil
-	}
-	return json.RawMessage(stored.String)
+	return snapshots[slot], true, nil
 }
 
 // topLogCountSpec describes one ranking query.
@@ -729,130 +676,60 @@ func ClearOldLogBodies(ctx context.Context, database *sql.DB, keepCount int64,
 	}
 }
 
-type logBodyCleanupRow struct {
-	requestLogID                 int64
-	requestSnapshot              sql.NullString
-	upstreamRequestOverride      sql.NullString
-	upstreamRequestIsOverride    int32
-	responseSnapshot             sql.NullString
-	downstreamResponseOverride   sql.NullString
-	downstreamResponseIsOverride int32
-}
-
+// clearOldLogBodiesBatch drops the bodies of up to batchSize of the oldest rows
+// outside the newest keepCount that still have them.
+//
+// The window is counted on the partial index of rows with bodies, by id: the
+// keepCount-th newest of them is the threshold, and everything below it goes.
+// Dropping a row's bodies deletes its body record, which frees the space once
+// CollectLogChunks takes the chunks only it listed; the metadata stays.
 func clearOldLogBodiesBatch(ctx context.Context, database *sql.DB, keepCount, batchSize int64) (uint64, error) {
-	rows, err := database.QueryContext(ctx, `SELECT p.request_log_id,
-              p.request_snapshot,
-              p.upstream_request_override,
-              p.upstream_request_is_override,
-              p.response_snapshot,
-              p.downstream_response_override,
-              p.downstream_response_is_override
-       FROM request_log_payloads AS p
-       WHERE p.bodies_cleared = 0
-         AND p.request_log_id NOT IN (
-             SELECT id FROM request_logs
-             ORDER BY created_at DESC, id DESC
-             LIMIT ?
-         )
-       ORDER BY p.request_log_id
-       LIMIT ?`, keepCount, batchSize)
-	if err != nil {
-		return 0, apperr.Database(err)
-	}
-
-	var pending []logBodyCleanupRow
-	for rows.Next() {
-		var row logBodyCleanupRow
-		if err := rows.Scan(&row.requestLogID, &row.requestSnapshot,
-			&row.upstreamRequestOverride, &row.upstreamRequestIsOverride,
-			&row.responseSnapshot, &row.downstreamResponseOverride,
-			&row.downstreamResponseIsOverride); err != nil {
-			rows.Close()
-			return 0, apperr.Database(err)
-		}
-		pending = append(pending, row)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return 0, apperr.Database(err)
-	}
-	if len(pending) == 0 {
-		return 0, nil
-	}
-
-	// The potentially large JSON values are parsed and shrunk before the write
-	// lock is acquired; the transaction only contains the bounded UPDATEs.
-	type update struct {
-		requestLogID               int64
-		requestSnapshot            any
-		upstreamRequestOverride    any
-		responseSnapshot           any
-		downstreamResponseOverride any
-	}
-	updates := make([]update, 0, len(pending))
-	for _, row := range pending {
-		updates = append(updates, update{
-			requestLogID:    row.requestLogID,
-			requestSnapshot: clearSnapshotBody(row.requestSnapshot, true),
-			upstreamRequestOverride: clearSnapshotBody(row.upstreamRequestOverride,
-				row.upstreamRequestIsOverride != 0),
-			responseSnapshot: clearSnapshotBody(row.responseSnapshot, true),
-			downstreamResponseOverride: clearSnapshotBody(row.downstreamResponseOverride,
-				row.downstreamResponseIsOverride != 0),
-		})
-	}
-
 	tx, err := database.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, apperr.Database(err)
 	}
 	defer tx.Rollback()
 
-	for _, entry := range updates {
-		_, err := tx.ExecContext(ctx, `UPDATE request_log_payloads
-           SET request_snapshot = ?,
-               upstream_request_override = ?,
-               response_snapshot = ?,
-               downstream_response_override = ?,
-               bodies_cleared = 1
-           WHERE request_log_id = ?`,
-			entry.requestSnapshot, entry.upstreamRequestOverride,
-			entry.responseSnapshot, entry.downstreamResponseOverride, entry.requestLogID)
-		if err != nil {
-			return 0, apperr.Database(err)
-		}
+	var threshold int64
+	err = tx.QueryRowContext(ctx, `SELECT request_log_id FROM request_log_snapshots
+       WHERE bodies_cleared = 0
+       ORDER BY request_log_id DESC
+       LIMIT 1 OFFSET ?`, keepCount-1).Scan(&threshold)
+	if errors.Is(err, sql.ErrNoRows) {
+		// Fewer rows than the window holds.
+		return 0, nil
+	}
+	if err != nil {
+		return 0, apperr.Database(err)
+	}
+
+	var first, last, count int64
+	err = tx.QueryRowContext(ctx, `SELECT COALESCE(MIN(request_log_id), 0),
+              COALESCE(MAX(request_log_id), 0), COUNT(*)
+       FROM (SELECT request_log_id FROM request_log_snapshots
+             WHERE bodies_cleared = 0 AND request_log_id < ?
+             ORDER BY request_log_id
+             LIMIT ?)`, threshold, batchSize).Scan(&first, &last, &count)
+	if err != nil {
+		return 0, apperr.Database(err)
+	}
+	if count == 0 {
+		return 0, nil
+	}
+
+	// Every row in [first, last] is below the threshold, so a range is exact.
+	if _, err := tx.ExecContext(ctx,
+		"DELETE FROM request_log_bodies WHERE request_log_id BETWEEN ? AND ?", first, last); err != nil {
+		return 0, apperr.Database(err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE request_log_snapshots SET bodies_cleared = 1
+       WHERE bodies_cleared = 0 AND request_log_id BETWEEN ? AND ?`, first, last); err != nil {
+		return 0, apperr.Database(err)
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, apperr.Database(err)
 	}
-	return uint64(len(pending)), nil
-}
-
-// clearedBodySnapshot replaces a snapshot whose JSON can no longer be parsed.
-const clearedBodySnapshot = `{"body":{"cleared":true}}`
-
-// clearSnapshotBody replaces the body of a stored snapshot while keeping its
-// metadata. It returns nil (a SQL NULL) when there was no snapshot.
-func clearSnapshotBody(snapshot sql.NullString, shouldClear bool) any {
-	if !snapshot.Valid {
-		return nil
-	}
-	if !shouldClear || snapshot.String == "" {
-		return snapshot.String
-	}
-
-	// A JSON null decodes without error into a nil map, and assigning to that
-	// panicked the cleanup goroutine, taking the whole process down.
-	var decoded map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(snapshot.String), &decoded); err != nil || decoded == nil {
-		return clearedBodySnapshot
-	}
-	decoded["body"] = json.RawMessage(`{"cleared":true}`)
-	encoded, err := json.Marshal(decoded)
-	if err != nil {
-		return clearedBodySnapshot
-	}
-	return string(encoded)
+	return uint64(count), nil
 }
 
 // ReclaimFreePages returns free SQLite pages to the filesystem when incremental

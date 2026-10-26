@@ -3,7 +3,6 @@ package db
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"strconv"
 	"testing"
@@ -126,13 +125,12 @@ func TestGetLogDetailResolvesOverridesAgainstCanonicalSnapshots(t *testing.T) {
 		t.Fatalf("insert log: %v", err)
 	}
 	// The upstream request matched the downstream one; the downstream response
-	// was explicitly absent.
-	if _, err := database.Exec(`INSERT INTO request_log_payloads
+	// was explicitly absent. Stored the way releases before chunked storage
+	// kept snapshots, and migrated.
+	seedLegacyPayloads(t, database, `INSERT INTO request_log_payloads
         (request_log_id, request_snapshot, upstream_request_override, upstream_request_is_override,
          response_snapshot, downstream_response_override, downstream_response_is_override)
-        VALUES (1, '{"body":{"text":"req"}}', NULL, 0, '{"body":{"text":"res"}}', NULL, 1)`); err != nil {
-		t.Fatalf("insert payload: %v", err)
-	}
+        VALUES (1, '{"body":{"text":"req"}}', NULL, 0, '{"body":{"text":"res"}}', NULL, 1)`)
 
 	detail, ok, err := GetLogDetail(ctx, database, 1)
 	if err != nil || !ok {
@@ -168,16 +166,16 @@ func TestGetLogSnapshotResolvesEachFieldLikeTheDetail(t *testing.T) {
             VALUES (1, 'POST', '/v1/responses', 'codex', 0)`,
 		`INSERT INTO request_logs (id, method, path, client_type, stream)
             VALUES (2, 'POST', '/v1/responses', 'codex', 0)`,
-		`INSERT INTO request_log_payloads
-            (request_log_id, request_snapshot, upstream_request_override, upstream_request_is_override,
-             response_snapshot, downstream_response_override, downstream_response_is_override)
-            VALUES (1, '{"body":{"text":"req"}}', '{"body":{"text":"up"}}', 1,
-                    '{"body":{"text":"res"}}', NULL, 1)`,
 	} {
 		if _, err := database.Exec(stmt); err != nil {
 			t.Fatalf("seed: %v", err)
 		}
 	}
+	seedLegacyPayloads(t, database, `INSERT INTO request_log_payloads
+            (request_log_id, request_snapshot, upstream_request_override, upstream_request_is_override,
+             response_snapshot, downstream_response_override, downstream_response_is_override)
+            VALUES (1, '{"body":{"text":"req"}}', '{"body":{"text":"up"}}', 1,
+                    '{"body":{"text":"res"}}', NULL, 1)`)
 
 	want := map[LogSnapshotField]string{
 		LogSnapshotDownstreamRequest:  `{"body":{"text":"req"}}`,
@@ -381,75 +379,17 @@ func TestDeleteOldLogsRemovesPayloadsWithTheirLogs(t *testing.T) {
 	database := memoryDB(t)
 	ctx := context.Background()
 
-	for i, age := range []string{"-40 days", "-1 days"} {
-		id := i + 1
-		if _, err := database.Exec(`INSERT INTO request_logs
-            (id, created_at, method, path, client_type, stream)
-            VALUES (?, datetime('now', ?), 'POST', '/v1/responses', 'codex', 0)`,
-			id, age); err != nil {
-			t.Fatalf("insert log: %v", err)
-		}
-		if _, err := database.Exec(`INSERT INTO request_log_payloads
-            (request_log_id, request_snapshot) VALUES (?, '{"body":{"text":"x"}}')`,
-			id); err != nil {
-			t.Fatalf("insert payload: %v", err)
-		}
-	}
+	storeTestLog(t, database, "-40 days", textSnapshot(`{}`, "x"))
+	storeTestLog(t, database, "-1 days", textSnapshot(`{}`, "x"))
 
 	if err := DeleteOldLogs(ctx, database, 30); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 
-	var logCount, payloadCount int64
-	if err := database.QueryRow("SELECT COUNT(*) FROM request_logs").Scan(&logCount); err != nil {
-		t.Fatalf("count logs: %v", err)
-	}
-	if err := database.QueryRow("SELECT COUNT(*) FROM request_log_payloads").
-		Scan(&payloadCount); err != nil {
-		t.Fatalf("count payloads: %v", err)
-	}
-	if logCount != 1 || payloadCount != 1 {
-		t.Errorf("after retention: %d logs, %d payloads, want 1 and 1", logCount, payloadCount)
-	}
-}
-
-func TestClearSnapshotBodyKeepsMetadataAndSurvivesCorruptJSON(t *testing.T) {
-	stored := nullString(`{"method":"POST","body":{"text":"secret"}}`)
-	cleared, ok := clearSnapshotBody(stored, true).(string)
-	if !ok {
-		t.Fatalf("clearSnapshotBody returned %T, want a string", clearSnapshotBody(stored, true))
-	}
-	var decoded map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(cleared), &decoded); err != nil {
-		t.Fatalf("decode cleared: %v", err)
-	}
-	if string(decoded["method"]) != `"POST"` {
-		t.Errorf("metadata was lost: %s", cleared)
-	}
-	if string(decoded["body"]) != `{"cleared":true}` {
-		t.Errorf("body = %s, want it cleared", decoded["body"])
-	}
-
-	// A snapshot that no longer parses is replaced wholesale rather than kept.
-	corrupt := clearSnapshotBody(nullString("not json"), true)
-	if corrupt != clearedBodySnapshot {
-		t.Errorf("corrupt snapshot = %v, want the cleared placeholder", corrupt)
-	}
-
-	// Nothing is rewritten when the row is not due for clearing.
-	untouched := clearSnapshotBody(stored, false)
-	if untouched != stored.String {
-		t.Errorf("snapshot = %v, want it untouched", untouched)
-	}
-
-	if clearSnapshotBody(nullStringInvalid(), true) != nil {
-		t.Error("an absent snapshot produced a value")
-	}
-
-	// A JSON null decodes into a nil map; writing into it panicked the cleanup
-	// goroutine, which has no recover.
-	if clearSnapshotBody(nullString("null"), true) != clearedBodySnapshot {
-		t.Error("a null snapshot was not replaced by the cleared placeholder")
+	logCount := countRows(t, database, "SELECT COUNT(*) FROM request_logs")
+	snapshotCount := countRows(t, database, "SELECT COUNT(*) FROM request_log_snapshots")
+	if logCount != 1 || snapshotCount != 1 {
+		t.Errorf("after retention: %d logs, %d snapshot rows, want 1 and 1", logCount, snapshotCount)
 	}
 }
 
@@ -696,35 +636,18 @@ func TestRetentionTakesThePayloadRowsWithIt(t *testing.T) {
 	database := memoryDB(t)
 	ctx := context.Background()
 
-	result, err := database.Exec(`INSERT INTO request_logs
-       (created_at, method, path, client_type, stream)
-       VALUES (datetime('now', '-40 days'), 'POST', '/v1/responses', 'codex', 0)`)
-	if err != nil {
-		t.Fatalf("insert log: %v", err)
-	}
-	logID, err := result.LastInsertId()
-	if err != nil {
-		t.Fatalf("last insert id: %v", err)
-	}
-	if _, err := database.Exec(`INSERT INTO request_log_payloads
-       (request_log_id, request_snapshot, response_snapshot)
-       VALUES (?, '{"body":"x"}', '{"body":"y"}')`, logID); err != nil {
-		t.Fatalf("insert payload: %v", err)
-	}
+	storeTestLog(t, database, "-40 days", textSnapshot(`{}`, "x"), nil, textSnapshot(`{}`, "y"))
 
 	if err := DeleteOldLogs(ctx, database, 30); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 
-	// The payload goes with its parent through ON DELETE CASCADE, which is why
-	// the delete no longer names it separately.
-	var payloads int64
-	if err := database.QueryRow(
-		"SELECT COUNT(*) FROM request_log_payloads").Scan(&payloads); err != nil {
-		t.Fatalf("count payloads: %v", err)
-	}
-	if payloads != 0 {
-		t.Errorf("%d payload rows survived their log row", payloads)
+	// The snapshot and body rows go with their parent through ON DELETE
+	// CASCADE, which is why the delete does not name them separately.
+	for _, table := range []string{"request_log_snapshots", "request_log_bodies"} {
+		if rows := countRows(t, database, "SELECT COUNT(*) FROM "+table); rows != 0 {
+			t.Errorf("%d %s rows survived their log row", rows, table)
+		}
 	}
 }
 
