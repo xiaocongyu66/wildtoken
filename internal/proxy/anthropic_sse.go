@@ -53,6 +53,33 @@ func (f *anthropicUsageFields) merge(next anthropicUsageFields) {
 	}
 }
 
+// hasCounts reports whether any billed total is non-zero.
+func (f anthropicUsageFields) hasCounts() bool {
+	nonZero := func(value *int32) bool { return value != nil && *value != 0 }
+	return nonZero(f.input) || nonZero(f.output) ||
+		nonZero(f.cacheRead) || nonZero(f.cacheCreation)
+}
+
+// fillMissing copies the counters this report did not carry.
+func (f *anthropicUsageFields) fillMissing(from anthropicUsageFields) {
+	if f.input == nil {
+		f.input = from.input
+	}
+	if f.cacheRead == nil {
+		f.cacheRead = from.cacheRead
+	}
+	if f.cacheCreation == nil {
+		f.cacheCreation = from.cacheCreation
+	}
+	if f.output == nil {
+		f.output = from.output
+	}
+	if f.thinking == nil {
+		f.thinking = from.thinking
+	}
+	f.seen = f.seen || from.seen
+}
+
 func (f anthropicUsageFields) usage() TokenUsage {
 	if !f.seen {
 		return TokenUsage{}
@@ -103,11 +130,21 @@ func decodeAnthropicStreamEvent(data []byte, eventType string) streamEvent {
 		result.terminal = true
 	}
 	// Some compatible upstreams put usage at the top level of any event rather
-	// than under message_start's message. It is read whenever the standard
-	// shape did not provide it; only message_start's is not final.
-	if !result.anthropic.seen && event.JSON.Usage.Valid() {
-		result.anthropic = usageFromDelta(event.Usage)
-		result.finalUsage = result.anthropic.seen && eventType != "message_start"
+	// than under message_start's message, or leave the standard shape partial.
+	// The top-level report fills whatever the standard one did not carry.
+	if event.JSON.Usage.Valid() {
+		top := usageFromDelta(event.Usage)
+		if !result.anthropic.hasCounts() {
+			result.anthropic = top
+		} else {
+			result.anthropic.fillMissing(top)
+		}
+		// Only message_delta and message_stop are the end of the report; usage
+		// on a content block may be incremental and is not final.
+		switch eventType {
+		case "message_delta", "message_stop":
+			result.finalUsage = result.anthropic.hasCounts()
+		}
 	}
 	return result
 }

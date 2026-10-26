@@ -72,6 +72,36 @@ func TestSDKSeesTextThinkingAndToolDeltasAsTheFirstToken(t *testing.T) {
 	}
 }
 
+// A partial nested message usage is completed from the event's top-level one.
+func TestPartialNestedUsageIsCompletedFromTheTopLevel(t *testing.T) {
+	body := []byte("event: message_start\n" +
+		`data: {"message":{"usage":{"output_tokens":1}},` +
+		`"usage":{"input_tokens":40,"cache_read_input_tokens":60,"output_tokens":1}}` + "\n\n" +
+		"event: message_delta\n" +
+		`data: {"usage":{"output_tokens":9}}` + "\n\n")
+
+	assertUsage(t, ExtractUsage(body, "text/event-stream"), map[string]any{
+		"prompt": int32(100), "completion": int32(9), "total": int32(109),
+		"prompt_cached": int32(60),
+	})
+}
+
+// Usage on a content block may be incremental and must not count as final.
+func TestContentBlockUsageIsNotFinal(t *testing.T) {
+	observation := &sseObservation{}
+	observation.observeChunk([]byte(`data: {"type":"content_block_delta",`+
+		`"usage":{"output_tokens":5}}`+"\n\n"), func() int32 { return 1 })
+	if observation.finalUsageSeen {
+		t.Fatal("usage on a content block was treated as final")
+	}
+
+	observation.observeChunk([]byte(`data: {"type":"message_delta",`+
+		`"usage":{"output_tokens":9}}`+"\n\n"), func() int32 { return 1 })
+	if !observation.finalUsageSeen {
+		t.Fatal("message_delta usage was not treated as final")
+	}
+}
+
 // Some compatible upstreams put usage at the top level of any event, not only
 // under message_start's message.
 func TestSDKReadsTopLevelAnthropicUsage(t *testing.T) {

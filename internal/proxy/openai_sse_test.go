@@ -88,6 +88,29 @@ func TestAFailedResponseWithoutAnErrorObjectIsStillAFailure(t *testing.T) {
 	}
 }
 
+// A zeroed usage in the response object carries no information; a real
+// top-level report must still be used.
+func TestAZeroedResponseUsageYieldsToTopLevelUsage(t *testing.T) {
+	body := []byte(`data: {"type":"response.completed",` +
+		`"response":{"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}},` +
+		`"usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120}}` + "\n\n")
+
+	assertUsage(t, ExtractUsage(body, "text/event-stream"), map[string]any{
+		"prompt": int32(100), "completion": int32(20), "total": int32(120),
+	})
+}
+
+// A Chat chunk whose usage is Anthropic-shaped (input_tokens, no prompt_tokens)
+// is read by the Responses usage type rather than losing the counts.
+func TestChatChunkWithInputTokenUsageIsRead(t *testing.T) {
+	body := []byte(`data: {"object":"chat.completion.chunk","choices":[],` +
+		`"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}` + "\n\n")
+
+	assertUsage(t, ExtractUsage(body, "text/event-stream"), map[string]any{
+		"prompt": int32(10), "completion": int32(5), "total": int32(15),
+	})
+}
+
 // Some compatible upstreams put usage at the top level of a Responses event
 // rather than under response.
 func TestSDKReadsTopLevelResponsesUsage(t *testing.T) {
@@ -248,12 +271,33 @@ func TestSDKSeesLegacyCompletionTextAsTheFirstToken(t *testing.T) {
 	}
 }
 
-// A chunk typed as Chat is not read by the Messages decoder, even when its
-// usage is shaped like Anthropic's.
-func TestSDKDoesNotReadAnthropicUsageFromAChatChunk(t *testing.T) {
+// A Chat chunk carrying Anthropic's cache counter is still read as Chat: the
+// counter is a subset of the prompt and is not added to it.
+func TestChatChunkDoesNotAggregateAnthropicCache(t *testing.T) {
 	body := []byte(`data: {"type":"chat.completion.chunk","choices":[],` +
-		`"usage":{"input_tokens":10,"output_tokens":5}}` + "\n\n")
-	if usage := ExtractUsage(body, "text/event-stream"); usage.TotalTokens != nil {
-		t.Fatalf("a Chat chunk read Anthropic usage %v", usage)
+		`"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":60}}` + "\n\n")
+
+	assertUsage(t, ExtractUsage(body, "text/event-stream"), map[string]any{
+		"prompt": int32(10), "completion": int32(5), "total": int32(15),
+		"prompt_cached": int32(60),
+	})
+}
+
+// A zero prompt on an abandoned stream is a placeholder; the request's own
+// text is estimated instead of billing the prompt as nothing.
+func TestAZeroPromptOnAnAbandonedStreamIsEstimated(t *testing.T) {
+	stream := &sseStream{
+		requestBody: []byte(`{"model":"m","messages":[{"role":"user","content":"hello there"}]}`),
+		observation: &sseObservation{outputEstimate: 5},
+	}
+	usage := stream.estimateUsage(TokenUsage{
+		PromptTokens:     ptrTo(int32(0)),
+		CompletionTokens: ptrTo(int32(0)),
+	})
+	if usage.PromptTokens == nil || *usage.PromptTokens == 0 {
+		t.Fatal("a zero prompt was not estimated")
+	}
+	if usage.TotalTokens == nil || *usage.TotalTokens == 0 {
+		t.Fatal("the total was not recomputed")
 	}
 }

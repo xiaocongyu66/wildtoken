@@ -57,6 +57,36 @@ func (f *openaiUsageFields) merge(next openaiUsageFields) {
 	}
 }
 
+// hasCounts reports whether any billed total is non-zero. A zeroed usage
+// carries no information and must not block a fuller report from being used.
+func (f openaiUsageFields) hasCounts() bool {
+	nonZero := func(value *int32) bool { return value != nil && *value != 0 }
+	return nonZero(f.prompt) || nonZero(f.completion) || nonZero(f.total)
+}
+
+// fillMissing copies the counters this report did not carry.
+func (f *openaiUsageFields) fillMissing(from openaiUsageFields) {
+	if f.prompt == nil {
+		f.prompt = from.prompt
+	}
+	if f.completion == nil {
+		f.completion = from.completion
+	}
+	if f.total == nil {
+		f.total = from.total
+	}
+	if f.cached == nil {
+		f.cached = from.cached
+	}
+	if f.cacheWrite == nil {
+		f.cacheWrite = from.cacheWrite
+	}
+	if f.reasoning == nil {
+		f.reasoning = from.reasoning
+	}
+	f.seen = f.seen || from.seen
+}
+
 func (f openaiUsageFields) usage() TokenUsage {
 	if !f.seen {
 		return TokenUsage{}
@@ -146,7 +176,22 @@ func decodeOpenAIChatEvent(data []byte, object string) (streamEvent, bool) {
 	}
 	if chunk.JSON.Usage.Valid() {
 		result.openai = usageFromCompletion(chunk.Usage)
-		result.finalUsage = result.openai.seen
+		// A chunk whose usage is shaped like Responses rather than Chat —
+		// input_tokens without prompt_tokens — is read by that type instead.
+		if result.openai.prompt == nil && bytes.Contains(data, []byte(`"input_tokens"`)) {
+			var compat struct {
+				Usage responses.ResponseUsage `json:"usage"`
+			}
+			if err := json.Unmarshal(data, &compat); err == nil {
+				fields := usageFromResponse(compat.Usage)
+				if !result.openai.hasCounts() {
+					result.openai = fields
+				} else {
+					result.openai.fillMissing(fields)
+				}
+			}
+		}
+		result.finalUsage = result.openai.hasCounts()
 	}
 	return result, true
 }
@@ -210,33 +255,31 @@ func decodeOpenAIResponseEvent(data []byte, eventType string) streamEvent {
 		result.fault = channelFaultStreamErrors[kind]
 		// A failed response may still report what it spent before failing.
 		result.openai = usageFromResponse(event.Response.Usage)
-		result.finalUsage = result.openai.seen
 	} else if event.JSON.Response.Valid() {
 		result.openai = usageFromResponse(event.Response.Usage)
-		// Only a terminal response's usage is final. An early event may carry
-		// a zeroed usage, and treating it as final would skip the estimate for
-		// a stream abandoned before the real counts arrived.
-		switch eventType {
-		case "response.completed", "response.incomplete", "response.cancelled":
-			result.finalUsage = result.openai.seen
-		}
 	}
 	// Some compatible upstreams put usage at the top level of the event rather
-	// than under response. Read it whenever the response object did not carry
-	// it; only a terminal event's top-level usage is final.
-	if !result.openai.seen && bytes.Contains(data, []byte(`"usage"`)) {
+	// than under response, or leave the response's usage zeroed. The top-level
+	// report fills whatever the response object did not carry.
+	if bytes.Contains(data, []byte(`"usage"`)) {
 		var wrapper struct {
 			Usage responses.ResponseUsage `json:"usage"`
 		}
 		if err := json.Unmarshal(data, &wrapper); err == nil {
-			if fields := usageFromResponse(wrapper.Usage); fields.seen {
-				result.openai = fields
-				switch eventType {
-				case "response.completed", "response.incomplete", "response.cancelled":
-					result.finalUsage = true
-				}
+			top := usageFromResponse(wrapper.Usage)
+			if !result.openai.hasCounts() {
+				result.openai = top
+			} else {
+				result.openai.fillMissing(top)
 			}
 		}
+	}
+	// Only a terminal response's usage is final. An early event may carry a
+	// zeroed usage, and treating it as final would skip the estimate for a
+	// stream abandoned before the real counts arrived.
+	switch eventType {
+	case "response.completed", "response.incomplete", "response.cancelled", "response.failed":
+		result.finalUsage = result.openai.hasCounts()
 	}
 	return result
 }
@@ -442,9 +485,15 @@ func usageFromResponse(usage responses.ResponseUsage) openaiUsageFields {
 		details := nestedTokenDetails(usage.JSON.ExtraFields, "input_token_details")
 		if fields.cached == nil {
 			fields.cached = usageInt32Value(details.CacheRead)
+			if fields.cached == nil {
+				fields.cached = usageInt32Value(details.CachedTokens)
+			}
 		}
 		if fields.cacheWrite == nil {
 			fields.cacheWrite = usageInt32Value(details.CacheCreation)
+			if fields.cacheWrite == nil {
+				fields.cacheWrite = usageInt32Value(details.CacheWrite)
+			}
 		}
 	}
 	fields.seen = fields.prompt != nil || fields.completion != nil || fields.total != nil
