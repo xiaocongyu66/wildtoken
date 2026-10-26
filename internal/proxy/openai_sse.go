@@ -112,14 +112,24 @@ func decodeOpenAIChatEvent(data []byte) (streamEvent, bool) {
 			}
 		}
 	}
-	// Some compatible upstreams stream whole messages rather than deltas.
 	if !result.visible {
-		var completion openai.ChatCompletion
-		if err := json.Unmarshal(data, &completion); err == nil {
-			for _, choice := range completion.Choices {
+		// Some compatible upstreams stream whole messages rather than deltas.
+		var message openai.ChatCompletion
+		if err := json.Unmarshal(data, &message); err == nil {
+			for _, choice := range message.Choices {
 				if choice.Message.Content != "" || len(choice.Message.ToolCalls) > 0 {
 					result.visible = true
 					break
+				}
+			}
+		}
+		// The legacy /v1/completions stream carries text rather than deltas.
+		var legacy openai.Completion
+		if err := json.Unmarshal(data, &legacy); err == nil {
+			for _, choice := range legacy.Choices {
+				if choice.Text != "" {
+					result.visible = true
+					result.textDelta += estimateTextTokens(choice.Text)
 				}
 			}
 		}
@@ -132,14 +142,14 @@ func decodeOpenAIChatEvent(data []byte) (streamEvent, bool) {
 }
 
 // decodeOpenAIResponseEvent reads an OpenAI Responses stream event.
-func decodeOpenAIResponseEvent(data []byte) streamEvent {
+func decodeOpenAIResponseEvent(data []byte, eventType string) streamEvent {
 	var event responses.ResponseStreamEventUnion
 	if err := json.Unmarshal(data, &event); err != nil {
 		return streamEvent{matched: true}
 	}
 
 	result := streamEvent{matched: true}
-	switch event.Type {
+	switch eventType {
 	case "response.completed", "response.failed", "response.incomplete", "response.cancelled":
 		result.terminal = true
 	case "error":
@@ -151,7 +161,7 @@ func decodeOpenAIResponseEvent(data []byte) streamEvent {
 		result.fault = channelFaultStreamErrors[event.Code]
 	}
 
-	switch event.Type {
+	switch eventType {
 	case "response.output_text.delta", "response.reasoning_text.delta",
 		"response.reasoning_summary_text.delta", "response.function_call_arguments.delta",
 		"response.custom_tool_call_input.delta":
@@ -164,16 +174,18 @@ func decodeOpenAIResponseEvent(data []byte) streamEvent {
 		if effort, ok := effortFromResponse(event.Response); ok {
 			result.effort, result.hasEffort = effort, true
 		}
-		if event.Type == "response.failed" {
-			failure := event.Response.Error
-			result.hasError = true
-			result.errKind = string(failure.Code)
-			result.errDetail = failure.Message
-			result.fault = channelFaultStreamErrors[result.errKind]
-		} else {
-			result.openai = usageFromResponse(event.Response.Usage)
-			result.finalUsage = result.openai.seen
-		}
+	}
+	if eventType == "response.failed" {
+		// A failed event is a failure even when it carries no error object; a
+		// stream that began as a 200 must not be logged as a success.
+		failure := event.Response.Error
+		result.hasError = true
+		result.errKind = string(failure.Code)
+		result.errDetail = failure.Message
+		result.fault = channelFaultStreamErrors[result.errKind]
+	} else if event.JSON.Response.Valid() {
+		result.openai = usageFromResponse(event.Response.Usage)
+		result.finalUsage = result.openai.seen
 	}
 	return result
 }
@@ -317,6 +329,9 @@ func usageFromResponse(usage responses.ResponseUsage) openaiUsageFields {
 	}
 	if usage.OutputTokensDetails.JSON.ReasoningTokens.Valid() {
 		fields.reasoning = usageInt64(usage.OutputTokensDetails.ReasoningTokens)
+	}
+	if fields.reasoning == nil {
+		fields.reasoning = firstExtraUsageInt64(usage.JSON.ExtraFields, "thinking_tokens")
 	}
 	fields.cacheWrite = firstExtraUsageInt64(usage.JSON.ExtraFields,
 		"cache_creation_input_tokens", "cache_creation_tokens", "cache_write_tokens")

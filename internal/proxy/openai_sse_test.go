@@ -68,8 +68,36 @@ func TestSDKChatObservationMatchesBufferedExtraction(t *testing.T) {
 	}
 }
 
+// A failed response is a failure even when it carries no error object: the
+// stream still began as a 200 and must not be logged as a success.
+func TestAFailedResponseWithoutAnErrorObjectIsStillAFailure(t *testing.T) {
+	observation := &sseObservation{}
+	observation.observeChunk([]byte(`data: {"type":"response.failed"}`+"\n\n"),
+		func() int32 { return 1 })
+	observation.finish(func() int32 { return 1 })
+
+	if observation.streamError == nil {
+		t.Fatal("a failed response without an error object was not recorded as a failure")
+	}
+	if !observation.terminalEventSeen {
+		t.Fatal("the failed event was not seen as terminal")
+	}
+}
+
+// The legacy /v1/completions stream carries text rather than a delta; its
+// first token is still what the console times.
+func TestSDKSeesLegacyCompletionTextAsTheFirstToken(t *testing.T) {
+	line := []byte(`data: {"object":"text_completion","choices":[{"text":"hi","index":0}]}` + "\n")
+	if !HasVisibleToken(line) {
+		t.Fatal("a legacy completion text chunk was not counted as the first token")
+	}
+	if HasVisibleToken([]byte(`data: {"object":"text_completion","choices":[{"text":"","index":0}]}` + "\n")) {
+		t.Fatal("an empty legacy completion text was counted as the first token")
+	}
+}
+
 // A malformed chat chunk still lands on the OpenAI SDK path and contributes
-// nothing rather than falling through to the generic OpenAI walker.
+// nothing rather than being read as some other event.
 func TestSDKIgnoresMalformedChatChunks(t *testing.T) {
 	if usage := ExtractUsage([]byte("data: {\"type\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{}}]\n\n"),
 		"text/event-stream"); usage.TotalTokens != nil {

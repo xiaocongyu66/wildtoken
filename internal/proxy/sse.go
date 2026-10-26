@@ -62,23 +62,31 @@ type eventEnvelope struct {
 }
 
 // decodeStreamEvent reads one SSE payload with the vendor SDK that owns it.
-func decodeStreamEvent(data []byte) streamEvent {
+//
+// hint is the SSE `event:` name of the frame the payload arrived in. Some
+// compatible upstreams type their events only there, leaving the data without
+// a `type` field, and the name is what tells the decoders what they are
+// looking at.
+func decodeStreamEvent(data []byte, hint string) streamEvent {
 	var envelope eventEnvelope
 	if err := json.Unmarshal(data, &envelope); err != nil {
 		return streamEvent{}
 	}
+	if envelope.Type == "" {
+		envelope.Type = hint
+	}
 	switch {
 	case isAnthropicStreamEventType(envelope.Type):
-		return decodeAnthropicStreamEvent(data)
+		return decodeAnthropicStreamEvent(data, envelope.Type)
 	case envelope.Type == "error":
 		// Anthropic nests the failure under `error`; the Responses API puts it
 		// at the top level of the event.
 		if event, ok := decodeNestedErrorEvent(data); ok {
 			return event
 		}
-		return decodeOpenAIResponseEvent(data)
+		return decodeOpenAIResponseEvent(data, envelope.Type)
 	case strings.HasPrefix(envelope.Type, "response."):
-		return decodeOpenAIResponseEvent(data)
+		return decodeOpenAIResponseEvent(data, envelope.Type)
 	default:
 		if event, ok := decodeOpenAIChatEvent(data); ok {
 			return event
@@ -153,8 +161,19 @@ func sseData(line string) (string, bool) {
 // HasVisibleToken reports whether a buffered SSE chunk contains a content token.
 func HasVisibleToken(chunk []byte) bool {
 	visible := false
+	eventName := ""
 	forEachSSELine(chunk, func(line []byte) bool {
-		if sseBytesLineHasVisibleToken(line) {
+		data, ok := sseDataBytes(line)
+		if !ok {
+			if name, found := sseEventName(line); found {
+				eventName = name
+			}
+			return true
+		}
+		if len(data) == 0 || string(data) == "[DONE]" {
+			return true
+		}
+		if decodeStreamEvent(data, eventName).visible {
 			visible = true
 			return false
 		}
@@ -163,25 +182,24 @@ func HasVisibleToken(chunk []byte) bool {
 	return visible
 }
 
-func sseBytesLineHasVisibleToken(line []byte) bool {
-	data, ok := sseDataBytes(bytes.TrimSuffix(line, []byte("\r")))
-	if !ok || len(data) == 0 || string(data) == "[DONE]" {
-		return false
-	}
-	return decodeStreamEvent(data).visible
-}
-
 // ExtractUsage reads token usage from either an SSE stream body or a JSON body.
 func ExtractUsage(rawBody []byte, contentType string) TokenUsage {
 	if IsSSEContentType(contentType) || strings.Contains(strings.ToLower(contentType), "sse") {
 		// A stream reports usage repeatedly, sometimes split across events.
 		var observation sseObservation
+		var eventName string
 		forEachSSELine(rawBody, func(line []byte) bool {
 			data, ok := sseDataBytes(line)
-			if !ok || len(data) == 0 || string(data) == "[DONE]" {
+			if !ok {
+				if name, found := sseEventName(line); found {
+					eventName = name
+				}
 				return true
 			}
-			event := decodeStreamEvent(data)
+			if len(data) == 0 || string(data) == "[DONE]" {
+				return true
+			}
+			event := decodeStreamEvent(data, eventName)
 			if !event.matched {
 				return true
 			}
@@ -199,6 +217,9 @@ func ExtractUsage(rawBody []byte, contentType string) TokenUsage {
 // SDK decode it; the first one to report a count owns the body.
 func extractBodyUsage(raw []byte) TokenUsage {
 	if usage, ok := chatBodyUsage(raw); ok {
+		return usage
+	}
+	if usage, ok := anthropicCacheUsage(raw); ok {
 		return usage
 	}
 	if usage, ok := responseBodyUsage(raw); ok {
@@ -236,7 +257,16 @@ func sseBytesLineIsTerminal(line []byte) bool {
 	if !found || data == "" || data == "[DONE]" {
 		return false
 	}
-	return decodeStreamEvent([]byte(data)).terminal
+	return decodeStreamEvent([]byte(data), "").terminal
+}
+
+// sseEventName returns the name of an `event:` line.
+func sseEventName(line []byte) (string, bool) {
+	name, found := bytes.CutPrefix(bytes.TrimSpace(line), []byte("event:"))
+	if !found {
+		return "", false
+	}
+	return strings.TrimSpace(string(name)), true
 }
 
 // lineTerminal reports a terminal `event:` name or `[DONE]` without a payload.
@@ -250,11 +280,14 @@ func lineTerminal(text string) bool {
 
 // sseObservation accumulates what a stream reveals as its bytes pass through.
 type sseObservation struct {
-	lineBuf                 []byte
-	lineOverflow            bool
-	firstTokenMs            *int32
-	terminalEventPending    bool
-	terminalEventSeen       bool
+	lineBuf              []byte
+	lineOverflow         bool
+	firstTokenMs         *int32
+	terminalEventPending bool
+	terminalEventSeen    bool
+	// eventName is the `event:` name of the frame being read, for upstreams
+	// that type their events only there.
+	eventName               string
 	anthropicUsage          anthropicUsageFields
 	openaiUsage             openaiUsageFields
 	responseReasoningEffort *string
@@ -291,13 +324,18 @@ func (o *sseObservation) observeLine(line []byte, elapsedMs func() int32) {
 			o.terminalEventSeen = true
 		}
 		o.terminalEventPending = false
+		o.eventName = ""
 		return
 	}
 
 	data, isData := sseData(text)
 	var event streamEvent
-	if isData && data != "" && data != "[DONE]" {
-		event = decodeStreamEvent([]byte(data))
+	if isData {
+		if data != "" && data != "[DONE]" {
+			event = decodeStreamEvent([]byte(data), o.eventName)
+		}
+	} else if name, found := sseEventName(line); found {
+		o.eventName = name
 	}
 
 	if o.firstTokenMs == nil && event.visible {
@@ -426,12 +464,16 @@ func (o *sseObservation) finish(elapsedMs func() int32) {
 func ExtractResponseReasoningEffort(rawBody []byte, contentType string) *string {
 	if strings.Contains(contentType, "event-stream") || bytes.HasPrefix(rawBody, []byte("data:")) {
 		var reported *string
+		var eventName string
 		forEachSSELine(rawBody, func(line []byte) bool {
 			data, ok := sseDataBytes(line)
 			if !ok {
+				if name, found := sseEventName(line); found {
+					eventName = name
+				}
 				return true
 			}
-			event := decodeStreamEvent(bytes.TrimSpace(data))
+			event := decodeStreamEvent(bytes.TrimSpace(data), eventName)
 			if event.hasEffort {
 				effort := event.effort
 				reported = &effort

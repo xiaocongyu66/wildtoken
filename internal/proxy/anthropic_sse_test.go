@@ -68,10 +68,23 @@ func TestSDKSeesTextThinkingAndToolDeltasAsTheFirstToken(t *testing.T) {
 	}
 }
 
+// A gateway may add total_tokens to a Messages usage. The cache counters still
+// mark it as Anthropic, so the prompt is aggregated rather than read as a
+// Responses input count.
+func TestAnthropicUsageWithATotalIsStillAggregated(t *testing.T) {
+	body := []byte(`{"usage":{"input_tokens":100,"output_tokens":40,` +
+		`"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"total_tokens":140}}`)
+
+	assertUsage(t, ExtractUsage(body, "application/json"), map[string]any{
+		"prompt": int32(150), "completion": int32(40), "total": int32(190),
+		"prompt_cached": int32(30), "cache_creation": int32(20),
+	})
+}
+
 // A LiteLLM-style payload keeps OpenAI's inclusive prompt_tokens beside
-// Anthropic's cache fields. It is not a Messages event, so the generic walker
-// must keep handling it and must not add the cache a second time.
-func TestSDKLeavesHybridPayloadsToTheGenericWalker(t *testing.T) {
+// Anthropic's cache fields. prompt_tokens wins, so the cache is not added a
+// second time.
+func TestSDKReadsLiteLLMHybridUsageAsChat(t *testing.T) {
 	body := []byte(`{"usage":{"prompt_tokens":12012,"completion_tokens":5,"total_tokens":12017,
         "prompt_tokens_details":{"cached_tokens":12000},
         "cache_creation_input_tokens":0,"cache_read_input_tokens":12000}}`)
@@ -105,6 +118,27 @@ func TestSDKObservationMatchesBufferedExtraction(t *testing.T) {
 	}
 	if usage.PromptCachedTokens == nil || *usage.PromptCachedTokens != 60 {
 		t.Fatalf("prompt cached = %v, want 60", usage.PromptCachedTokens)
+	}
+}
+
+// Some compatible upstreams name the event only in the SSE `event:` field and
+// leave `type` out of the payload. The frame's name is what identifies it.
+func TestSDKReadsEventsNamedOnlyByTheSSEField(t *testing.T) {
+	body := []byte("event: message_start\n" +
+		`data: {"message":{"usage":{"input_tokens":40,"cache_read_input_tokens":60,"output_tokens":1}}}` + "\n\n" +
+		"event: message_delta\n" +
+		`data: {"usage":{"output_tokens":9}}` + "\n\n")
+
+	assertUsage(t, ExtractUsage(body, "text/event-stream"), map[string]any{
+		"prompt": int32(100), "completion": int32(9), "total": int32(109),
+		"prompt_cached": int32(60),
+	})
+
+	observation := &sseObservation{}
+	observation.observeChunk(body, func() int32 { return 3 })
+	observation.finish(func() int32 { return 3 })
+	if usage := observation.tokenUsage(); usage.TotalTokens == nil || *usage.TotalTokens != 109 {
+		t.Fatalf("observation total = %v, want 109", usage.TotalTokens)
 	}
 }
 

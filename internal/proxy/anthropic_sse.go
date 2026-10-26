@@ -73,14 +73,14 @@ func (f anthropicUsageFields) usage() TokenUsage {
 
 // decodeAnthropicStreamEvent reads one Messages stream event with the official
 // SDK's types.
-func decodeAnthropicStreamEvent(data []byte) streamEvent {
+func decodeAnthropicStreamEvent(data []byte, eventType string) streamEvent {
 	var event anthropic.MessageStreamEventUnion
 	if err := json.Unmarshal(data, &event); err != nil {
 		return streamEvent{matched: true}
 	}
 
 	result := streamEvent{matched: true}
-	switch event.Type {
+	switch eventType {
 	case "message_start":
 		if event.JSON.Message.Valid() {
 			result.anthropic = usageFromAnthropic(event.Message.Usage)
@@ -103,6 +103,26 @@ func decodeAnthropicStreamEvent(data []byte) streamEvent {
 		result.terminal = true
 	}
 	return result
+}
+
+// anthropicCacheUsage reports usage only when the body names Anthropic's
+// top-level cache counters. A gateway may add total_tokens to a Messages
+// usage, which would otherwise let the Responses reader claim the body and
+// drop the cache from the prompt.
+func anthropicCacheUsage(raw []byte) (TokenUsage, bool) {
+	var message anthropic.Message
+	if err := json.Unmarshal(raw, &message); err != nil {
+		return TokenUsage{}, false
+	}
+	if !message.Usage.JSON.CacheReadInputTokens.Valid() &&
+		!message.Usage.JSON.CacheCreationInputTokens.Valid() {
+		return TokenUsage{}, false
+	}
+	fields := usageFromAnthropic(message.Usage)
+	if !fields.seen {
+		return TokenUsage{}, false
+	}
+	return fields.usage(), true
 }
 
 // anthropicBodyUsage reads usage from a buffered Messages response.
@@ -150,6 +170,13 @@ func usageFromAnthropic(usage anthropic.Usage) anthropicUsageFields {
 	// add; it is read from the field the SDK keeps as unknown.
 	if fields.thinking == nil {
 		fields.thinking = extraAnthropicInt64(usage.JSON.ExtraFields, "thinking_tokens")
+	}
+	if fields.cacheRead == nil {
+		fields.cacheRead = extraAnthropicInt64(usage.JSON.ExtraFields, "cache_read_tokens")
+	}
+	if fields.cacheCreation == nil {
+		fields.cacheCreation = extraAnthropicInt64(usage.JSON.ExtraFields,
+			"cache_creation_tokens")
 	}
 	fields.seen = fields.input != nil || fields.cacheRead != nil ||
 		fields.cacheCreation != nil || fields.output != nil || fields.thinking != nil
