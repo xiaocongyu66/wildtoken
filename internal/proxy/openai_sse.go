@@ -105,16 +105,24 @@ func decodeOpenAIChatEvent(data []byte, object string) (streamEvent, bool) {
 		}
 		// Reasoning text has no field in the SDK's chunk type; vendors put it in
 		// the payload the SDK keeps as extra fields.
-		for _, name := range []string{"reasoning_content", "reasoning"} {
+		for _, name := range []string{"reasoning_content", "reasoning", "text"} {
 			if text := extraString(delta.JSON.ExtraFields, name); text != "" {
 				result.visible = true
 				result.textDelta += estimateTextTokens(text)
 			}
 		}
 	}
-	// A standard chunk needs no shape fallback. Only a whole-message or legacy
-	// shape, which the chunk type does not model, is tried.
-	if !result.visible && object != "chat.completion.chunk" {
+	// A standard chunk needs no shape fallback. A whole-message or legacy shape,
+	// which the chunk type does not model, is tried; so is a payload labelled as
+	// a chunk but carrying no delta at all.
+	hasDelta := false
+	for _, choice := range chunk.Choices {
+		if choice.JSON.Delta.Valid() {
+			hasDelta = true
+			break
+		}
+	}
+	if !result.visible && (object != "chat.completion.chunk" || !hasDelta) {
 		// Some compatible upstreams stream whole messages rather than deltas.
 		var message openai.ChatCompletion
 		if err := json.Unmarshal(data, &message); err == nil {
@@ -180,11 +188,26 @@ func decodeOpenAIResponseEvent(data []byte, eventType string) streamEvent {
 	if eventType == "response.failed" {
 		// A failed event is a failure even when it carries no error object; a
 		// stream that began as a 200 must not be logged as a success.
-		failure := event.Response.Error
+		//
+		// The SDK's ResponseError has a code but no type, so the error is
+		// decoded once more to keep a type-only fault, which is what the channel
+		// fault list keys on.
+		var failure openai.ErrorObject
+		if raw := event.JSON.Response.Raw(); raw != "" {
+			var envelope struct {
+				Error openai.ErrorObject `json:"error"`
+			}
+			_ = json.Unmarshal([]byte(raw), &envelope)
+			failure = envelope.Error
+		}
+		kind := failure.Code
+		if kind == "" {
+			kind = failure.Type
+		}
 		result.hasError = true
-		result.errKind = string(failure.Code)
+		result.errKind = kind
 		result.errDetail = failure.Message
-		result.fault = channelFaultStreamErrors[result.errKind]
+		result.fault = channelFaultStreamErrors[kind]
 		// A failed response may still report what it spent before failing.
 		result.openai = usageFromResponse(event.Response.Usage)
 		result.finalUsage = result.openai.seen
@@ -196,6 +219,23 @@ func decodeOpenAIResponseEvent(data []byte, eventType string) streamEvent {
 		switch eventType {
 		case "response.completed", "response.incomplete", "response.cancelled":
 			result.finalUsage = result.openai.seen
+		}
+	}
+	// Some compatible upstreams put usage at the top level of the event rather
+	// than under response. Read it whenever the response object did not carry
+	// it; only a terminal event's top-level usage is final.
+	if !result.openai.seen {
+		var wrapper struct {
+			Usage responses.ResponseUsage `json:"usage"`
+		}
+		if err := json.Unmarshal(data, &wrapper); err == nil {
+			if fields := usageFromResponse(wrapper.Usage); fields.seen {
+				result.openai = fields
+				switch eventType {
+				case "response.completed", "response.incomplete", "response.cancelled":
+					result.finalUsage = true
+				}
+			}
 		}
 	}
 	return result
@@ -246,23 +286,40 @@ func chatBodyUsage(raw []byte) (TokenUsage, bool) {
 // A Responses usage always reports a total, which an Anthropic usage never
 // does; requiring both keeps Anthropic bodies out of this branch.
 func responseBodyUsage(raw []byte) (TokenUsage, bool) {
+	for _, response := range responseCandidates(raw) {
+		if !response.Usage.JSON.InputTokens.Valid() || !response.Usage.JSON.TotalTokens.Valid() {
+			continue
+		}
+		return usageFromResponse(response.Usage).usage(), true
+	}
+	return TokenUsage{}, false
+}
+
+// responseCandidates decodes a Responses body both as itself and as the
+// `{"response": ...}` wrapper some gateways add.
+func responseCandidates(raw []byte) []responses.Response {
 	var response responses.Response
 	if err := json.Unmarshal(raw, &response); err != nil {
-		return TokenUsage{}, false
+		return nil
 	}
-	if !response.Usage.JSON.InputTokens.Valid() || !response.Usage.JSON.TotalTokens.Valid() {
-		return TokenUsage{}, false
+	candidates := []responses.Response{response}
+	var wrapped struct {
+		Response responses.Response `json:"response"`
 	}
-	return usageFromResponse(response.Usage).usage(), true
+	if err := json.Unmarshal(raw, &wrapped); err == nil {
+		candidates = append(candidates, wrapped.Response)
+	}
+	return candidates
 }
 
 // responseReasoningEffort reads the effort a buffered response reported.
 func responseReasoningEffort(raw []byte) (string, bool) {
-	var response responses.Response
-	if err := json.Unmarshal(raw, &response); err != nil {
-		return "", false
+	for _, response := range responseCandidates(raw) {
+		if effort, ok := effortFromResponse(response); ok {
+			return effort, true
+		}
 	}
-	return effortFromResponse(response)
+	return "", false
 }
 
 func effortFromResponse(response responses.Response) (string, bool) {
@@ -288,8 +345,11 @@ func openaiUsageFromJSON(raw []byte) (openaiUsageFields, bool) {
 	var response responses.ResponseUsage
 	if err := json.NewDecoder(bytes.NewReader(raw)).Decode(&response); err == nil {
 		// A Responses usage always reports a total; an Anthropic usage never
-		// does, and must fall through to the Messages reader below.
-		if fields := usageFromResponse(response); fields.seen && fields.total != nil {
+		// does, and must fall through to the Messages reader below. A usage
+		// that carries Anthropic's cache counters is Anthropic even when a
+		// gateway added a total to it.
+		if fields := usageFromResponse(response); fields.seen && fields.total != nil &&
+			!looksAnthropicUsage(raw) {
 			return fields, true
 		}
 	}
@@ -322,6 +382,25 @@ func usageFromCompletion(usage openai.CompletionUsage) openaiUsageFields {
 	if fields.cached == nil {
 		fields.cached = firstExtraUsageInt64(usage.JSON.ExtraFields,
 			"cache_read_input_tokens", "cache_read_tokens")
+	}
+	if fields.cached == nil || fields.cacheWrite == nil {
+		// Some gateways use input_tokens_details (or input_token_details)
+		// instead of prompt_tokens_details; the SDK keeps both as unknown.
+		for _, name := range []string{"input_tokens_details", "input_token_details"} {
+			details := nestedTokenDetails(usage.JSON.ExtraFields, name)
+			if fields.cached == nil {
+				fields.cached = usageInt32Value(details.CachedTokens)
+				if fields.cached == nil {
+					fields.cached = usageInt32Value(details.CacheRead)
+				}
+			}
+			if fields.cacheWrite == nil {
+				fields.cacheWrite = usageInt32Value(details.CacheWrite)
+				if fields.cacheWrite == nil {
+					fields.cacheWrite = usageInt32Value(details.CacheCreation)
+				}
+			}
+		}
 	}
 	fields.seen = fields.prompt != nil || fields.completion != nil || fields.total != nil
 	return fields
@@ -356,6 +435,15 @@ func usageFromResponse(usage responses.ResponseUsage) openaiUsageFields {
 	if fields.cached == nil {
 		fields.cached = firstExtraUsageInt64(usage.JSON.ExtraFields,
 			"cache_read_input_tokens", "cache_read_tokens")
+	}
+	if fields.cached == nil || fields.cacheWrite == nil {
+		details := nestedTokenDetails(usage.JSON.ExtraFields, "input_token_details")
+		if fields.cached == nil {
+			fields.cached = usageInt32Value(details.CacheRead)
+		}
+		if fields.cacheWrite == nil {
+			fields.cacheWrite = usageInt32Value(details.CacheCreation)
+		}
 	}
 	fields.seen = fields.prompt != nil || fields.completion != nil || fields.total != nil
 	return fields

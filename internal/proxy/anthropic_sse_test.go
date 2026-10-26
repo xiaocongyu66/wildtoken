@@ -1,6 +1,10 @@
 package proxy
 
-import "testing"
+import (
+	"slices"
+	"strings"
+	"testing"
+)
 
 // The Messages stream is split: message_start carries the input counts and
 // message_delta the output. Reading them through the official SDK must reach
@@ -66,6 +70,37 @@ func TestSDKSeesTextThinkingAndToolDeltasAsTheFirstToken(t *testing.T) {
 			t.Errorf("%s was counted as the first token", name)
 		}
 	}
+}
+
+// Some compatible upstreams put usage at the top level of any event, not only
+// under message_start's message.
+func TestSDKReadsTopLevelAnthropicUsage(t *testing.T) {
+	body := []byte("event: message_stop\n" +
+		`data: {"usage":{"input_tokens":10,"output_tokens":77}}` + "\n\n")
+
+	assertUsage(t, ExtractUsage(body, "text/event-stream"), map[string]any{
+		"prompt": int32(10), "completion": int32(77), "total": int32(87),
+	})
+}
+
+// An oversized line whose usage is Anthropic-shaped, even with a total added,
+// must be aggregated rather than read as a Responses input count.
+func TestOversizedAnthropicUsageWithATotalIsAggregated(t *testing.T) {
+	image := strings.Repeat("A", maxSSEEventBytes+1024)
+	stream := []byte(`data: {"type":"content_block_stop","b64_json":"` + image +
+		`","usage":{"input_tokens":100,"output_tokens":40,` +
+		`"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"total_tokens":140}}` + "\n\n")
+
+	var observation sseObservation
+	for chunk := range slices.Chunk(stream, 32<<10) {
+		observation.observeChunk(chunk, func() int32 { return 0 })
+	}
+	observation.finish(func() int32 { return 0 })
+
+	assertUsage(t, observation.tokenUsage(), map[string]any{
+		"prompt": int32(150), "completion": int32(40), "total": int32(190),
+		"prompt_cached": int32(30), "cache_creation": int32(20),
+	})
 }
 
 // A usage with a total and a cache_creation but no cache_read is OpenAI-shaped:

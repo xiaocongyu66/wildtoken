@@ -88,6 +88,73 @@ func TestAFailedResponseWithoutAnErrorObjectIsStillAFailure(t *testing.T) {
 	}
 }
 
+// Some compatible upstreams put usage at the top level of a Responses event
+// rather than under response.
+func TestSDKReadsTopLevelResponsesUsage(t *testing.T) {
+	body := []byte(`data: {"type":"response.completed","usage":` +
+		`{"input_tokens":3,"output_tokens":2,"total_tokens":5}}` + "\n\n")
+
+	assertUsage(t, ExtractUsage(body, "text/event-stream"), map[string]any{
+		"prompt": int32(3), "completion": int32(2), "total": int32(5),
+	})
+
+	observation := &sseObservation{}
+	observation.observeChunk(body, func() int32 { return 1 })
+	observation.finish(func() int32 { return 1 })
+	if !observation.finalUsageSeen {
+		t.Fatal("a terminal top-level usage was not treated as final")
+	}
+}
+
+// A Responses failed event whose error names only a type still blames the
+// channel.
+func TestAFailedResponseWithOnlyAnErrorTypeIsCharged(t *testing.T) {
+	observation := &sseObservation{}
+	observation.observeChunk([]byte(`data: {"type":"response.failed","response":`+
+		`{"error":{"type":"server_error","message":"x"}}}`+"\n\n"),
+		func() int32 { return 1 })
+	observation.finish(func() int32 { return 1 })
+
+	if observation.streamError == nil {
+		t.Fatal("the failed response was not recorded")
+	}
+	if !observation.streamErrorFault {
+		t.Fatal("a server_error type was not charged to the channel")
+	}
+}
+
+// input_tokens_details is a Chat usage spelling the SDK does not model.
+func TestChatInputTokensDetailsAliasesAreRead(t *testing.T) {
+	body := []byte(`{"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150,` +
+		`"input_tokens_details":{"cached_tokens":10,"cache_write_tokens":20}}}`)
+
+	assertUsage(t, ExtractUsage(body, "application/json"), map[string]any{
+		"prompt": int32(100), "completion": int32(50), "total": int32(150),
+		"prompt_cached": int32(10), "cache_creation": int32(20),
+	})
+}
+
+// A bare delta.text is still a visible token.
+func TestSDKSeesDeltaTextAsTheFirstToken(t *testing.T) {
+	line := []byte(`data: {"object":"chat.completion.chunk","choices":[{"delta":{"text":"hi"}}]}` + "\n")
+	if !HasVisibleToken(line) {
+		t.Fatal("delta.text was not counted as the first token")
+	}
+}
+
+// A Responses body wrapped under response is still read.
+func TestWrappedResponsesBodyIsRead(t *testing.T) {
+	body := []byte(`{"response":{"reasoning":{"effort":"high"},` +
+		`"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`)
+
+	assertUsage(t, ExtractUsage(body, "application/json"), map[string]any{
+		"prompt": int32(3), "completion": int32(2), "total": int32(5),
+	})
+	if effort := ExtractResponseReasoningEffort(body, "application/json"); effort == nil || *effort != "high" {
+		t.Fatalf("effort = %v, want high", effort)
+	}
+}
+
 // A Responses usage has input_tokens and a total but no prompt_tokens. The
 // oversized-line recovery must read it as Responses, not as a Chat usage that
 // only reports a total.
@@ -104,6 +171,18 @@ func TestOversizedResponsesUsageKeepsPromptAndCompletion(t *testing.T) {
 
 	assertUsage(t, observation.tokenUsage(), map[string]any{
 		"prompt": int32(10), "completion": int32(20), "total": int32(30),
+	})
+}
+
+// Responses puts the cache-write counter in input_tokens_details, not at the
+// usage level. It must still be read.
+func TestResponsesNestedCacheWriteIsRead(t *testing.T) {
+	body := []byte(`{"usage":{"input_tokens":100,"output_tokens":50,"total_tokens":150,` +
+		`"input_tokens_details":{"cached_tokens":10,"cache_write_tokens":20}}}`)
+
+	assertUsage(t, ExtractUsage(body, "application/json"), map[string]any{
+		"prompt": int32(100), "completion": int32(50), "total": int32(150),
+		"prompt_cached": int32(10), "cache_creation": int32(20),
 	})
 }
 
