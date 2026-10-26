@@ -185,7 +185,13 @@ func decodeOpenAIResponseEvent(data []byte, eventType string) streamEvent {
 		result.fault = channelFaultStreamErrors[result.errKind]
 	} else if event.JSON.Response.Valid() {
 		result.openai = usageFromResponse(event.Response.Usage)
-		result.finalUsage = result.openai.seen
+		// Only a terminal response's usage is final. An early event may carry
+		// a zeroed usage, and treating it as final would skip the estimate for
+		// a stream abandoned before the real counts arrived.
+		switch eventType {
+		case "response.completed", "response.incomplete", "response.cancelled":
+			result.finalUsage = result.openai.seen
+		}
 	}
 	return result
 }

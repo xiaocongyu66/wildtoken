@@ -84,6 +84,28 @@ func TestAFailedResponseWithoutAnErrorObjectIsStillAFailure(t *testing.T) {
 	}
 }
 
+// An early response event that carries a zeroed usage must not be mistaken for
+// the final counts; an abandoned stream still needs its estimate.
+func TestSDKDoesNotTreatEarlyResponsesUsageAsFinal(t *testing.T) {
+	observation := &sseObservation{}
+	observation.observeChunk([]byte(`data: {"type":"response.created","response":`+
+		`{"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`+"\n\n"),
+		func() int32 { return 1 })
+	observation.finish(func() int32 { return 1 })
+	if observation.finalUsageSeen {
+		t.Fatal("an early zeroed usage was treated as final")
+	}
+
+	completed := &sseObservation{}
+	completed.observeChunk([]byte(`data: {"type":"response.completed","response":`+
+		`{"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`+"\n\n"),
+		func() int32 { return 1 })
+	completed.finish(func() int32 { return 1 })
+	if !completed.finalUsageSeen {
+		t.Fatal("the completed usage was not treated as final")
+	}
+}
+
 // The legacy /v1/completions stream carries text rather than a delta; its
 // first token is still what the console times.
 func TestSDKSeesLegacyCompletionTextAsTheFirstToken(t *testing.T) {

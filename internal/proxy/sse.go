@@ -163,11 +163,9 @@ func HasVisibleToken(chunk []byte) bool {
 	visible := false
 	eventName := ""
 	forEachSSELine(chunk, func(line []byte) bool {
+		eventName = sseFrameName(line, eventName)
 		data, ok := sseDataBytes(line)
 		if !ok {
-			if name, found := sseEventName(line); found {
-				eventName = name
-			}
 			return true
 		}
 		if len(data) == 0 || string(data) == "[DONE]" {
@@ -189,11 +187,9 @@ func ExtractUsage(rawBody []byte, contentType string) TokenUsage {
 		var observation sseObservation
 		var eventName string
 		forEachSSELine(rawBody, func(line []byte) bool {
+			eventName = sseFrameName(line, eventName)
 			data, ok := sseDataBytes(line)
 			if !ok {
-				if name, found := sseEventName(line); found {
-					eventName = name
-				}
 				return true
 			}
 			if len(data) == 0 || string(data) == "[DONE]" {
@@ -267,6 +263,19 @@ func sseEventName(line []byte) (string, bool) {
 		return "", false
 	}
 	return strings.TrimSpace(string(name)), true
+}
+
+// sseFrameName tracks the `event:` name of the frame a line belongs to. A
+// blank line dispatches the frame and clears the name, so it cannot leak into
+// the next one.
+func sseFrameName(line []byte, current string) string {
+	if len(bytes.TrimSpace(line)) == 0 {
+		return ""
+	}
+	if name, found := sseEventName(line); found {
+		return name
+	}
+	return current
 }
 
 // lineTerminal reports a terminal `event:` name or `[DONE]` without a payload.
@@ -466,11 +475,9 @@ func ExtractResponseReasoningEffort(rawBody []byte, contentType string) *string 
 		var reported *string
 		var eventName string
 		forEachSSELine(rawBody, func(line []byte) bool {
+			eventName = sseFrameName(line, eventName)
 			data, ok := sseDataBytes(line)
 			if !ok {
-				if name, found := sseEventName(line); found {
-					eventName = name
-				}
 				return true
 			}
 			event := decodeStreamEvent(bytes.TrimSpace(data), eventName)
