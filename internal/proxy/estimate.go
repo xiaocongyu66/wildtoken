@@ -22,43 +22,6 @@ func estimateTextTokens(text string) int64 {
 	return (ascii+3)/4 + other
 }
 
-// estimateDeltaTokens counts the text one streamed event added: content,
-// reasoning and tool-call arguments, in each protocol's shape.
-func estimateDeltaTokens(payload jsonValue) int64 {
-	var tokens int64
-	add := func(value any) {
-		if text, ok := value.(string); ok {
-			tokens += estimateTextTokens(text)
-		}
-	}
-
-	switch eventType, _ := payload["type"].(string); eventType {
-	case "content_block_delta":
-		delta := payload["delta"]
-		add(valueAt(delta, "text"))
-		add(valueAt(delta, "thinking"))
-		add(valueAt(delta, "partial_json"))
-	case "response.output_text.delta", "response.reasoning_text.delta",
-		"response.reasoning_summary_text.delta", "response.function_call_arguments.delta",
-		"response.custom_tool_call_input.delta":
-		add(payload["delta"])
-	}
-
-	choices, _ := payload["choices"].([]any)
-	for _, choice := range choices {
-		delta := valueAt(choice, "delta")
-		add(valueAt(delta, "content"))
-		add(valueAt(delta, "reasoning_content"))
-		add(valueAt(delta, "reasoning"))
-		calls, _ := valueAt(delta, "tool_calls").([]any)
-		for _, call := range calls {
-			add(valueAt(call, "function", "name"))
-			add(valueAt(call, "function", "arguments"))
-		}
-	}
-	return tokens
-}
-
 // estimateRequestTokens approximates a request's prompt from its text. Inline
 // data — a data: URL, or a long run with no whitespace, as base64 is — is
 // skipped: an image costs its provider's rate, not its encoding's length.
