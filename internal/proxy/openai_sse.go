@@ -303,7 +303,7 @@ func responseCandidates(raw []byte) []responses.Response {
 		return nil
 	}
 	candidates := []responses.Response{response}
-	if bytes.Contains(raw, []byte(`"response"`)) {
+	if bytes.Contains(raw, []byte(`"response":`)) {
 		var wrapped struct {
 			Response responses.Response `json:"response"`
 		}

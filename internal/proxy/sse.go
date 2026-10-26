@@ -149,14 +149,8 @@ func sseDataBytes(line []byte) ([]byte, bool) {
 	return bytes.TrimLeft(rest, " \t"), true
 }
 
-// sseData returns the payload of a `data:` line.
-func sseData(line string) (string, bool) {
-	rest, found := strings.CutPrefix(strings.TrimSpace(line), "data:")
-	if !found {
-		return "", false
-	}
-	return strings.TrimLeft(rest, " \t"), true
-}
+// sseDone is the terminator line's payload.
+var sseDone = []byte("[DONE]")
 
 // HasVisibleToken reports whether a buffered SSE chunk contains a content token.
 func HasVisibleToken(chunk []byte) bool {
@@ -168,7 +162,7 @@ func HasVisibleToken(chunk []byte) bool {
 		if !ok {
 			return true
 		}
-		if len(data) == 0 || string(data) == "[DONE]" {
+		if len(data) == 0 || bytes.Equal(data, sseDone) {
 			return true
 		}
 		if decodeStreamEvent(data, eventName).visible {
@@ -192,7 +186,7 @@ func ExtractUsage(rawBody []byte, contentType string) TokenUsage {
 			if !ok {
 				return true
 			}
-			if len(data) == 0 || string(data) == "[DONE]" {
+			if len(data) == 0 || bytes.Equal(data, sseDone) {
 				return true
 			}
 			event := decodeStreamEvent(data, eventName)
@@ -245,15 +239,15 @@ func isTerminalSSEEventType(eventType string) bool {
 // sseBytesLineIsTerminal reports whether a line ends the stream, either as an
 // `event:` name or as the payload's own type.
 func sseBytesLineIsTerminal(line []byte) bool {
-	text := strings.TrimSpace(string(bytes.TrimSuffix(line, []byte("\r"))))
+	text := bytes.TrimSpace(bytes.TrimSuffix(line, []byte("\r")))
 	if lineTerminal(text) {
 		return true
 	}
-	data, found := sseData(text)
-	if !found || data == "" || data == "[DONE]" {
+	data, found := sseDataBytes(text)
+	if !found || len(data) == 0 || bytes.Equal(data, sseDone) {
 		return false
 	}
-	return decodeStreamEvent([]byte(data), "").terminal
+	return decodeStreamEvent(data, "").terminal
 }
 
 // sseEventName returns the name of an `event:` line.
@@ -279,12 +273,12 @@ func sseFrameName(line []byte, current string) string {
 }
 
 // lineTerminal reports a terminal `event:` name or `[DONE]` without a payload.
-func lineTerminal(text string) bool {
-	if name, found := strings.CutPrefix(text, "event:"); found {
-		return isTerminalSSEEventType(strings.TrimSpace(name))
+func lineTerminal(text []byte) bool {
+	if name, found := bytes.CutPrefix(text, []byte("event:")); found {
+		return isTerminalSSEEventType(string(bytes.TrimSpace(name)))
 	}
-	data, found := sseData(text)
-	return found && data == "[DONE]"
+	data, found := sseDataBytes(text)
+	return found && bytes.Equal(data, sseDone)
 }
 
 // sseObservation accumulates what a stream reveals as its bytes pass through.
@@ -307,9 +301,11 @@ type sseObservation struct {
 	// overflowTail keeps the end of a line too long to buffer, where an
 	// oversized event carries its usage.
 	overflowTail []byte
-	// finalUsageSeen is set by usage from any event but message_start, whose
-	// output count is a placeholder. outputEstimate approximates the tokens the
-	// stream's deltas carried, for billing one abandoned before its usage.
+	// finalUsageSeen is set by a report that is the stream's final usage: any
+	// Messages event but message_start, whose output count is a placeholder,
+	// and only a terminal Responses event. outputEstimate approximates the
+	// tokens the stream's deltas carried, for billing one abandoned before its
+	// usage.
 	finalUsageSeen bool
 	outputEstimate int64
 }
@@ -325,8 +321,8 @@ func (o *sseObservation) tokenUsage() TokenUsage {
 // observeLine folds one complete line into the observation. elapsedMs reports
 // how long the request has been running, for time-to-first-token.
 func (o *sseObservation) observeLine(line []byte, elapsedMs func() int32) {
-	text := strings.TrimSpace(string(bytes.TrimSuffix(line, []byte("\r"))))
-	if text == "" {
+	text := bytes.TrimSpace(bytes.TrimSuffix(line, []byte("\r")))
+	if len(text) == 0 {
 		// A blank line closes an event, which is what confirms a pending
 		// terminal event actually arrived in full.
 		if o.terminalEventPending {
@@ -337,13 +333,13 @@ func (o *sseObservation) observeLine(line []byte, elapsedMs func() int32) {
 		return
 	}
 
-	data, isData := sseData(text)
+	data, isData := sseDataBytes(text)
 	var event streamEvent
 	if isData {
-		if data != "" && data != "[DONE]" {
-			event = decodeStreamEvent([]byte(data), o.eventName)
+		if len(data) > 0 && !bytes.Equal(data, sseDone) {
+			event = decodeStreamEvent(data, o.eventName)
 		}
-	} else if name, found := sseEventName(line); found {
+	} else if name, found := sseEventName(text); found {
 		o.eventName = name
 	}
 

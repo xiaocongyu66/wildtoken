@@ -248,11 +248,12 @@ func TestSDKSeesLegacyCompletionTextAsTheFirstToken(t *testing.T) {
 	}
 }
 
-// A malformed chat chunk still lands on the OpenAI SDK path and contributes
-// nothing rather than being read as some other event.
-func TestSDKIgnoresMalformedChatChunks(t *testing.T) {
-	if usage := ExtractUsage([]byte("data: {\"type\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{}}]\n\n"),
-		"text/event-stream"); usage.TotalTokens != nil {
-		t.Fatalf("malformed chunk produced usage %v", usage)
+// A chunk typed as Chat is not read by the Messages decoder, even when its
+// usage is shaped like Anthropic's.
+func TestSDKDoesNotReadAnthropicUsageFromAChatChunk(t *testing.T) {
+	body := []byte(`data: {"type":"chat.completion.chunk","choices":[],` +
+		`"usage":{"input_tokens":10,"output_tokens":5}}` + "\n\n")
+	if usage := ExtractUsage(body, "text/event-stream"); usage.TotalTokens != nil {
+		t.Fatalf("a Chat chunk read Anthropic usage %v", usage)
 	}
 }

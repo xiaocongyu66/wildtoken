@@ -212,9 +212,6 @@ func usageFromAnthropic(usage anthropic.Usage) anthropicUsageFields {
 		fields.thinking = extraAnthropicInt64(usage.OutputTokensDetails.JSON.ExtraFields,
 			"reasoning_tokens")
 	}
-	if fields.cacheRead == nil {
-		fields.cacheRead = extraAnthropicInt64(usage.JSON.ExtraFields, "cache_read_tokens")
-	}
 	if fields.cacheRead == nil || fields.cacheCreation == nil {
 		details := nestedTokenDetails(usage.JSON.ExtraFields, "input_token_details")
 		if fields.cacheRead == nil {

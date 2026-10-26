@@ -190,11 +190,13 @@ func TestSDKReadsEventsNamedOnlyByTheSSEField(t *testing.T) {
 	}
 }
 
-// A malformed event of a known type is still an Anthropic event: it must not
-// fall through and be read as an OpenAI payload.
-func TestSDKIgnoresMalformedAnthropicEvents(t *testing.T) {
-	if usage := ExtractUsage([]byte("data: {\"type\":\"message_delta\"\n\n"),
-		"text/event-stream"); usage.TotalTokens != nil {
-		t.Fatalf("malformed event produced usage %v", usage)
+// An event typed as Messages is not read by the Chat decoder, even when its
+// usage is shaped like Chat's. The distinction is what keeps one vendor's
+// counters from being read as the other's.
+func TestSDKDoesNotReadChatShapedUsageFromAMessagesEvent(t *testing.T) {
+	body := []byte(`data: {"type":"message_delta","usage":` +
+		`{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}` + "\n\n")
+	if usage := ExtractUsage(body, "text/event-stream"); usage.TotalTokens != nil {
+		t.Fatalf("a Messages event read Chat usage %v", usage)
 	}
 }
