@@ -88,7 +88,7 @@ func decodeStreamEvent(data []byte, hint string) streamEvent {
 	case strings.HasPrefix(envelope.Type, "response."):
 		return decodeOpenAIResponseEvent(data, envelope.Type)
 	default:
-		if event, ok := decodeOpenAIChatEvent(data); ok {
+		if event, ok := decodeOpenAIChatEvent(data, envelope.Object); ok {
 			return event
 		}
 		if event, ok := decodeNestedErrorEvent(data); ok {

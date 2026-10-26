@@ -76,7 +76,7 @@ func (f openaiUsageFields) usage() TokenUsage {
 }
 
 // decodeOpenAIChatEvent reads a Chat Completions chunk with the official SDK.
-func decodeOpenAIChatEvent(data []byte) (streamEvent, bool) {
+func decodeOpenAIChatEvent(data []byte, object string) (streamEvent, bool) {
 	var chunk openai.ChatCompletionChunk
 	if err := json.Unmarshal(data, &chunk); err != nil {
 		return streamEvent{}, false
@@ -112,7 +112,9 @@ func decodeOpenAIChatEvent(data []byte) (streamEvent, bool) {
 			}
 		}
 	}
-	if !result.visible {
+	// A standard chunk needs no shape fallback. Only a whole-message or legacy
+	// shape, which the chunk type does not model, is tried.
+	if !result.visible && object != "chat.completion.chunk" {
 		// Some compatible upstreams stream whole messages rather than deltas.
 		var message openai.ChatCompletion
 		if err := json.Unmarshal(data, &message); err == nil {
@@ -183,6 +185,9 @@ func decodeOpenAIResponseEvent(data []byte, eventType string) streamEvent {
 		result.errKind = string(failure.Code)
 		result.errDetail = failure.Message
 		result.fault = channelFaultStreamErrors[result.errKind]
+		// A failed response may still report what it spent before failing.
+		result.openai = usageFromResponse(event.Response.Usage)
+		result.finalUsage = result.openai.seen
 	} else if event.JSON.Response.Valid() {
 		result.openai = usageFromResponse(event.Response.Usage)
 		// Only a terminal response's usage is final. An early event may carry
@@ -273,7 +278,10 @@ func effortFromResponse(response responses.Response) (string, bool) {
 func openaiUsageFromJSON(raw []byte) (openaiUsageFields, bool) {
 	var completion openai.CompletionUsage
 	if err := json.NewDecoder(bytes.NewReader(raw)).Decode(&completion); err == nil {
-		if fields := usageFromCompletion(completion); fields.seen {
+		// prompt_tokens is what makes this a Chat usage. A Responses or
+		// Anthropic usage also has a total, and would otherwise be returned
+		// with its prompt and completion missing.
+		if fields := usageFromCompletion(completion); fields.prompt != nil {
 			return fields, true
 		}
 	}

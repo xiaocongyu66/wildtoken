@@ -1,6 +1,10 @@
 package proxy
 
-import "testing"
+import (
+	"slices"
+	"strings"
+	"testing"
+)
 
 // A Chat Completions chunk is read with the official SDK: content and tool-call
 // deltas count toward the first visible token, and the final chunk's usage is
@@ -82,6 +86,53 @@ func TestAFailedResponseWithoutAnErrorObjectIsStillAFailure(t *testing.T) {
 	if !observation.terminalEventSeen {
 		t.Fatal("the failed event was not seen as terminal")
 	}
+}
+
+// A Responses usage has input_tokens and a total but no prompt_tokens. The
+// oversized-line recovery must read it as Responses, not as a Chat usage that
+// only reports a total.
+func TestOversizedResponsesUsageKeepsPromptAndCompletion(t *testing.T) {
+	image := strings.Repeat("A", maxSSEEventBytes+1024)
+	stream := []byte(`data: {"type":"response.image_generation_call.completed","b64_json":"` + image +
+		`","usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30}}` + "\n\n")
+
+	var observation sseObservation
+	for chunk := range slices.Chunk(stream, 32<<10) {
+		observation.observeChunk(chunk, func() int32 { return 0 })
+	}
+	observation.finish(func() int32 { return 0 })
+
+	assertUsage(t, observation.tokenUsage(), map[string]any{
+		"prompt": int32(10), "completion": int32(20), "total": int32(30),
+	})
+}
+
+// A failed response may still report what it spent before failing.
+func TestAFailedResponseKeepsItsUsage(t *testing.T) {
+	observation := &sseObservation{}
+	observation.observeChunk([]byte(`data: {"type":"response.failed","response":`+
+		`{"error":{"code":"server_error","message":"x"},`+
+		`"usage":{"input_tokens":4,"output_tokens":6,"total_tokens":10}}}`+"\n\n"),
+		func() int32 { return 1 })
+	observation.finish(func() int32 { return 1 })
+
+	if observation.streamError == nil {
+		t.Fatal("the failed response was not recorded as a failure")
+	}
+	assertUsage(t, observation.tokenUsage(), map[string]any{
+		"prompt": int32(4), "completion": int32(6), "total": int32(10),
+	})
+}
+
+// Some compatible upstreams name the event only in the SSE `event:` field and
+// leave `type` out of the payload.
+func TestSDKReadsResponsesEventNamedOnlyByTheSSEField(t *testing.T) {
+	body := []byte("event: response.completed\n" +
+		`data: {"response":{"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}` + "\n\n")
+
+	assertUsage(t, ExtractUsage(body, "text/event-stream"), map[string]any{
+		"prompt": int32(3), "completion": int32(2), "total": int32(5),
+	})
 }
 
 // An early response event that carries a zeroed usage must not be mistaken for

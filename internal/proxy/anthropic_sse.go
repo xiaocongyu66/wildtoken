@@ -114,11 +114,21 @@ func anthropicCacheUsage(raw []byte) (TokenUsage, bool) {
 	if err := json.Unmarshal(raw, &message); err != nil {
 		return TokenUsage{}, false
 	}
-	if !message.Usage.JSON.CacheReadInputTokens.Valid() &&
-		!message.Usage.JSON.CacheCreationInputTokens.Valid() {
+	usage := message.Usage
+	// The classification is the one the request log has always used: a
+	// top-level cache read or a thinking breakdown marks Anthropic outright, a
+	// bare cache_creation only when no total is reported. With a total and no
+	// cache read, the cache counters are subsets and are not added.
+	hasCacheRead := usage.JSON.CacheReadInputTokens.Valid() ||
+		extraAnthropicInt64(usage.JSON.ExtraFields, "cache_read_tokens") != nil
+	hasThinking := usage.OutputTokensDetails.JSON.ThinkingTokens.Valid() ||
+		extraAnthropicInt64(usage.JSON.ExtraFields, "thinking_tokens") != nil
+	hasTotal := extraAnthropicInt64(usage.JSON.ExtraFields, "total_tokens") != nil
+	hasCacheCreationOnly := usage.JSON.CacheCreationInputTokens.Valid() && !hasTotal
+	if !hasCacheRead && !hasThinking && !hasCacheCreationOnly {
 		return TokenUsage{}, false
 	}
-	fields := usageFromAnthropic(message.Usage)
+	fields := usageFromAnthropic(usage)
 	if !fields.seen {
 		return TokenUsage{}, false
 	}
@@ -216,6 +226,16 @@ func usageFromDelta(usage anthropic.MessageDeltaUsage) anthropicUsageFields {
 	}
 	if usage.OutputTokensDetails.JSON.ThinkingTokens.Valid() {
 		fields.thinking = usageInt64(usage.OutputTokensDetails.ThinkingTokens)
+	}
+	if fields.thinking == nil {
+		fields.thinking = extraAnthropicInt64(usage.JSON.ExtraFields, "thinking_tokens")
+	}
+	if fields.cacheRead == nil {
+		fields.cacheRead = extraAnthropicInt64(usage.JSON.ExtraFields, "cache_read_tokens")
+	}
+	if fields.cacheCreation == nil {
+		fields.cacheCreation = extraAnthropicInt64(usage.JSON.ExtraFields,
+			"cache_creation_tokens")
 	}
 	fields.seen = fields.input != nil || fields.cacheRead != nil ||
 		fields.cacheCreation != nil || fields.output != nil || fields.thinking != nil

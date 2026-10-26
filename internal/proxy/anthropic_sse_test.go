@@ -68,8 +68,21 @@ func TestSDKSeesTextThinkingAndToolDeltasAsTheFirstToken(t *testing.T) {
 	}
 }
 
-// A gateway may add total_tokens to a Messages usage. The cache counters still
-// mark it as Anthropic, so the prompt is aggregated rather than read as a
+// A usage with a total and a cache_creation but no cache_read is OpenAI-shaped:
+// the cache counter is a subset and must not be added to the prompt. This is
+// the classifier the request log has always used.
+func TestCacheCreationWithATotalIsNotAddedToThePrompt(t *testing.T) {
+	body := []byte(`{"usage":{"input_tokens":11,"output_tokens":7,"total_tokens":18,` +
+		`"cache_creation_input_tokens":5}}`)
+
+	assertUsage(t, ExtractUsage(body, "application/json"), map[string]any{
+		"prompt": int32(11), "completion": int32(7), "total": int32(18),
+		"cache_creation": int32(5),
+	})
+}
+
+// A gateway may add total_tokens to a Messages usage. The cache read still
+// marks it as Anthropic, so the prompt is aggregated rather than read as a
 // Responses input count.
 func TestAnthropicUsageWithATotalIsStillAggregated(t *testing.T) {
 	body := []byte(`{"usage":{"input_tokens":100,"output_tokens":40,` +
