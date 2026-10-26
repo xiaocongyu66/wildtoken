@@ -224,7 +224,7 @@ func decodeOpenAIResponseEvent(data []byte, eventType string) streamEvent {
 	// Some compatible upstreams put usage at the top level of the event rather
 	// than under response. Read it whenever the response object did not carry
 	// it; only a terminal event's top-level usage is final.
-	if !result.openai.seen {
+	if !result.openai.seen && bytes.Contains(data, []byte(`"usage"`)) {
 		var wrapper struct {
 			Usage responses.ResponseUsage `json:"usage"`
 		}
@@ -303,11 +303,13 @@ func responseCandidates(raw []byte) []responses.Response {
 		return nil
 	}
 	candidates := []responses.Response{response}
-	var wrapped struct {
-		Response responses.Response `json:"response"`
-	}
-	if err := json.Unmarshal(raw, &wrapped); err == nil {
-		candidates = append(candidates, wrapped.Response)
+	if bytes.Contains(raw, []byte(`"response"`)) {
+		var wrapped struct {
+			Response responses.Response `json:"response"`
+		}
+		if err := json.Unmarshal(raw, &wrapped); err == nil {
+			candidates = append(candidates, wrapped.Response)
+		}
 	}
 	return candidates
 }
