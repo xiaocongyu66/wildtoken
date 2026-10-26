@@ -537,6 +537,7 @@ func ProxyRequest(ctx context.Context, deps Deps, policy AutoWeightPolicy,
 	responseSnapshot := SnapshotResponse(status, responseHeaders, deps.Images.Rewrite(bodyBytes),
 		requestCtx.LogBodyMaxBytes)
 	isStream := bytes.HasPrefix(bodyBytes, []byte("data:")) ||
+		bytes.HasPrefix(bytes.TrimSpace(bodyBytes), []byte("event:")) ||
 		strings.Contains(contentType, "event-stream")
 	// A stream sent as text/plain is read as one too; parsed as JSON, its
 	// usage came back empty and the request went unbilled.
@@ -565,7 +566,7 @@ func ProxyRequest(ctx context.Context, deps Deps, policy AutoWeightPolicy,
 		entry.Error = streamError
 	}
 	entry.Stream = isStream
-	entry.ResponseReasoningEffort = ExtractResponseReasoningEffort(bodyBytes, contentType)
+	entry.ResponseReasoningEffort = ExtractResponseReasoningEffort(bodyBytes, usageContentType)
 	entry.PromptTokens = usage.PromptTokens
 	entry.CompletionTokens = usage.CompletionTokens
 	entry.TotalTokens = usage.TotalTokens

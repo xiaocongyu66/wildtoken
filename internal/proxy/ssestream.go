@@ -296,7 +296,9 @@ func ptrTo[T any](value T) *T { return &value }
 // so a reported completion only stands when it is larger.
 func (s *sseStream) estimateUsage(reported TokenUsage) TokenUsage {
 	prompt := reported.PromptTokens
-	if prompt == nil {
+	if prompt == nil || *prompt == 0 {
+		// A zero prompt is a placeholder, not a report: every request carries
+		// at least some input. Leaving it at zero would bill the stream unpaid.
 		prompt = ptrTo(clampTokens(estimateRequestTokens(s.requestBody)))
 	}
 	completion := ptrTo(clampTokens(s.observation.outputEstimate))
