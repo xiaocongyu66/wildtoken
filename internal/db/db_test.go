@@ -39,7 +39,8 @@ func TestInitIsIdempotent(t *testing.T) {
 	}
 
 	for _, table := range []string{
-		"upstreams", "api_tokens", "request_logs", "request_log_payloads",
+		"upstreams", "api_tokens", "request_logs",
+		"log_metas", "log_chunks", "request_log_snapshots", "request_log_bodies",
 		"runtime_settings", "admin_credential",
 		"model_test_prompt_templates",
 	} {

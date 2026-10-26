@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"strings"
 )
 
 // ensureColumn adds a column when a database created by an older schema lacks it.
@@ -62,7 +63,12 @@ func Init(ctx context.Context, db *sql.DB) error {
 		createAdminCredential,
 		"CREATE INDEX IF NOT EXISTS idx_upstreams_enabled_priority ON upstreams(enabled, priority, id);",
 		createRequestLogs,
-		createRequestLogPayloads,
+		createLogMetas,
+		createLogChunks,
+		createRequestLogSnapshots,
+		createRequestLogBodies,
+		// The keep-count cleanup walks the newest rows that still have bodies.
+		"CREATE INDEX IF NOT EXISTS idx_request_log_snapshots_uncleared ON request_log_snapshots(request_log_id) WHERE bodies_cleared = 0;",
 		"CREATE INDEX IF NOT EXISTS idx_request_logs_created_at ON request_logs(created_at);",
 		"CREATE INDEX IF NOT EXISTS idx_request_logs_upstream_created_at ON request_logs(upstream_id, created_at);",
 		// The DESC pair these replace was never used. id is the rowid, which
@@ -82,7 +88,6 @@ func Init(ctx context.Context, db *sql.DB) error {
 		// took the write lock for as long as that scan, with every proxied
 		// request's log write queued behind it.
 		"CREATE INDEX IF NOT EXISTS idx_request_logs_downstream_token_created_at ON request_logs(downstream_token_id, created_at);",
-		"CREATE INDEX IF NOT EXISTS idx_request_log_payloads_bodies_cleared ON request_log_payloads(bodies_cleared, request_log_id);",
 		createAPITokens,
 		createGroups,
 		seedDefaultGroup,
@@ -176,7 +181,7 @@ func Init(ctx context.Context, db *sql.DB) error {
 		}
 	}
 
-	if _, err := db.ExecContext(ctx, createRuntimeSettings); err != nil {
+	if _, err := db.ExecContext(ctx, runtimeSettingsTable("runtime_settings")); err != nil {
 		return err
 	}
 	for _, column := range []struct{ name, definition string }{
@@ -197,11 +202,55 @@ func Init(ctx context.Context, db *sql.DB) error {
 			return err
 		}
 	}
+	if err := widenRuntimeSettingsLimits(ctx, db); err != nil {
+		return err
+	}
 	if _, err := db.ExecContext(ctx, seedRuntimeSettings); err != nil {
 		return err
 	}
 
-	return nil
+	return migrateLegacyLogPayloads(ctx, db)
+}
+
+// widenRuntimeSettingsLimits rebuilds a settings table whose CHECK constraints
+// still carry the log limits of a release that stored bodies whole: at most
+// 10,000 rows with bodies and 1 MiB per body.
+//
+// SQLite cannot alter a constraint, so the table is recreated under another
+// name, filled by column name — a database that gained columns through
+// ensureColumn has them at the end, not where the definition puts them — and
+// renamed into place, all in one transaction.
+func widenRuntimeSettingsLimits(ctx context.Context, db *sql.DB) error {
+	var definition string
+	if err := db.QueryRowContext(ctx,
+		"SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'runtime_settings'").
+		Scan(&definition); err != nil {
+		return fmt.Errorf("read the settings table definition: %w", err)
+	}
+	// A substring test rather than a comparison: after the rename SQLite keeps
+	// the table name quoted in the stored definition.
+	if strings.Contains(definition, keepCountCheck) && strings.Contains(definition, maxBytesCheck) {
+		return nil
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	columns := "id, " + runtimeSettingsColumns
+	for _, statement := range []string{
+		runtimeSettingsTable("runtime_settings_widened"),
+		"INSERT INTO runtime_settings_widened (" + columns + ") SELECT " + columns + " FROM runtime_settings",
+		"DROP TABLE runtime_settings",
+		"ALTER TABLE runtime_settings_widened RENAME TO runtime_settings",
+	} {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("widen the settings limits: %w", err)
+		}
+	}
+	return tx.Commit()
 }
 
 // CheckAutoVacuum warns when incremental auto-vacuum is not active, which means

@@ -218,6 +218,12 @@ const (
 	// MaxDashboardMultiplier bounds the display multiplier; beyond this it is
 	// a typo, not a choice.
 	MaxDashboardMultiplier float64 = 1000
+	// MaxLogBodyKeepCount bounds how many recent logs keep their bodies. Bodies
+	// are stored as deduplicated chunks, so a resent conversation costs only its
+	// new turn and a long window stays affordable.
+	MaxLogBodyKeepCount int64 = 100000
+	// MaxLogBodyMaxBytes is 128 MiB, the largest response the proxy buffers.
+	MaxLogBodyMaxBytes int64 = 128 << 20
 )
 
 // RuntimeSettings is the operator-editable policy stored in SQLite.
@@ -279,9 +285,9 @@ func (s *RuntimeSettings) Validate() error {
 		min, max int64
 		message  string
 	}{
-		{s.LogBodyKeepCount, 1, 10000, "log_body_keep_count must be between 1 and 10000"},
+		{s.LogBodyKeepCount, 1, MaxLogBodyKeepCount, "log_body_keep_count must be between 1 and 100000"},
 		{s.LogRetentionDays, 1, 3650, "log_retention_days must be between 1 and 3650"},
-		{s.LogBodyMaxBytes, 0, 1048576, "log_body_max_bytes must be between 0 and 1048576"},
+		{s.LogBodyMaxBytes, 0, MaxLogBodyMaxBytes, "log_body_max_bytes must be between 0 and 134217728"},
 		{s.MaxRetries, 0, 5, "max_retries must be between 0 and 5"},
 		{s.SameUpstreamRetryIntervalMs, 0, 60000, "same_upstream_retry_interval_ms must be between 0 and 60000"},
 		{s.AutoWeightFailurePenalty, 0, 100, "auto_weight_failure_penalty must be between 0 and 100"},

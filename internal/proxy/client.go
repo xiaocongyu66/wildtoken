@@ -13,6 +13,7 @@ import (
 
 	"github.com/liguangsheng/wildtoken/internal/apperr"
 	"github.com/liguangsheng/wildtoken/internal/imagestore"
+	"github.com/liguangsheng/wildtoken/internal/logbody"
 	"github.com/liguangsheng/wildtoken/internal/metrics"
 	"github.com/liguangsheng/wildtoken/internal/models"
 )
@@ -315,8 +316,8 @@ type PreparedRequest struct {
 	// effort mapping has rewritten one into the other.
 	ReasoningEffort         *string
 	UpstreamReasoningEffort *string
-	DownstreamSnapshot      json.RawMessage
-	UpstreamSnapshot        json.RawMessage
+	DownstreamSnapshot      *logbody.Snapshot
+	UpstreamSnapshot        *logbody.Snapshot
 }
 
 // PrepareRequest resolves one attempt against its selected upstream.
